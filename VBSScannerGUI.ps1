@@ -1,24 +1,27 @@
 <#
 .SYNOPSIS
-    VBS Scanner Utility v2.0 - GUI-based tool for scanning .vbs files with Archive metadata extraction.
+    VBS Scanner Utility v1.0 - GUI-based tool for scanning .vbs files and MSI/MST VBScript indicators.
 
 .DESCRIPTION
     A WinForms-based PowerShell 5.1 tool that:
     - Scans local devices (by name), UNC paths, or structured Archive roots for .vbs files
+    - NEW: Scans MSI/MST files for VBScript usage patterns (CustomActions, ActiveSetup, Binary streams)
     - For Archive Root scans, extracts PackageName, Version, and Build from path structure
     - Shows live progress with responsive UI
-    - Displays results in a DataGridView with context menu actions
+    - Displays results in DataGridView with context menu actions
     - Generates HTML reports with embedded WebBrowser preview
     - Logs all activities using CMTRACE-compatible format
 
-    Phase 2 Enhancement: Archive Root scanning with metadata extraction
-    Archive Structure: \\Server\Archive\Vendor\PackageName\Version\Type\Build\files
+    Phase 3 Enhancement: MSI/MST VBScript Indicator Scanner
+    - Detects VBScript CustomActions in MSI files
+    - Identifies Active Setup patterns with cscript/wscript references
+    - Optional deep Binary stream scanning for embedded scripts
 
 .NOTES
-    Author: Enterprise Endpoint Engineering
-    Version: 2.0.0
+    Author: Bharadwaj Kothalanka
+    Version: 1.0.0
     Requires: PowerShell 5.1, .NET Framework 4.5+
-    Date: 2026-03-22
+    Date: 2026-03-23
 #>
 
 #Requires -Version 5.1
@@ -32,7 +35,7 @@ Add-Type -AssemblyName System.Web
 
 #region ===== SCRIPT VARIABLES =====
 $Script:AppName = "VBS Scanner Utility"
-$Script:AppVersion = "2.0.0"
+$Script:AppVersion = "1.0.0"
 $Script:StartTime = Get-Date
 $Script:Timestamp = $Script:StartTime.ToString("yyyyMMdd_HHmmss")
 $Script:DefaultOutputFolder = [Environment]::GetFolderPath("MyDocuments")
@@ -42,8 +45,15 @@ $Script:ScanResults = [System.Collections.ArrayList]::new()
 $Script:ErrorCount = 0
 $Script:ScanCancelled = $false
 $Script:IsScanning = $false
-$Script:CurrentEntryType = "DeviceName"  # DeviceName, UNC, ArchiveRoot
-$Script:ArchiveRoot = ""  # Stores the archive root for metadata extraction
+$Script:CurrentEntryType = "DeviceName"
+$Script:ArchiveRoot = ""
+$Script:CurrentScanMode = "VBSFileScan"  # VBSFileScan or MSIMSTScan
+
+# MSI/MST Scan specific variables
+$Script:MsiScanResults = [System.Collections.ArrayList]::new()
+$Script:MsiErrorCount = 0
+$Script:MsiFilesScanned = 0
+$Script:MsiFilesWithFindings = 0
 #endregion
 
 #region ===== CMTRACE-COMPATIBLE LOGGING =====
@@ -134,10 +144,6 @@ function Test-PathExcluded {
 }
 
 function Get-ScanRootFromInput {
-    <#
-    .SYNOPSIS
-        Determines the scan root path based on input type.
-    #>
     param(
         [string]$InputType,
         [string]$DeviceName,
@@ -151,11 +157,9 @@ function Get-ScanRootFromInput {
                 return $null
             }
             $CleanName = $DeviceName.Trim().TrimStart('\')
-            # If it looks like a local path (e.g., C:\temp), use it directly
             if ($CleanName -match '^[A-Za-z]:\\') {
                 return $CleanName
             }
-            # Otherwise treat as device name and convert to admin share
             return "\\$CleanName\C$"
         }
         "UNC" {
@@ -177,31 +181,6 @@ function Get-ScanRootFromInput {
 }
 
 function Get-ArchiveMetadataFromPath {
-    <#
-    .SYNOPSIS
-        Extracts PackageName, Version, and Build from an archive-structured path.
-
-    .DESCRIPTION
-        Parses the file path based on the expected archive structure:
-        \\Server\Archive\Vendor\PackageName\Version\Type\Build\file.vbs
-
-        Segments after the archive root:
-        [0] = Vendor
-        [1] = PackageName
-        [2] = Version
-        [3] = Type
-        [4] = Build
-        [5+] = Subfolders/File
-
-    .PARAMETER ArchiveRoot
-        The base archive path (e.g., \\Server\Archive)
-
-    .PARAMETER FullPath
-        The complete file path to parse
-
-    .OUTPUTS
-        PSCustomObject with PackageName, Version, Build properties
-    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -218,29 +197,21 @@ function Get-ArchiveMetadataFromPath {
     }
 
     try {
-        # Normalize paths for comparison (case-insensitive, consistent separators)
         $NormalizedRoot = $ArchiveRoot.TrimEnd('\', '/').ToLower()
         $NormalizedPath = $FullPath.ToLower()
 
-        # Verify the file is under the archive root
         if (-not $NormalizedPath.StartsWith($NormalizedRoot)) {
             Write-CMTraceLog -Message "Path does not match archive root. Path: $FullPath | Root: $ArchiveRoot" -Severity 2 -Component "ArchiveMetadata"
             return $Result
         }
 
-        # Get the relative path after the archive root
         $RelativePath = $FullPath.Substring($ArchiveRoot.Length).TrimStart('\', '/')
-
-        # Split into segments
         $Segments = $RelativePath -split '[\\/]' | Where-Object { $_ -ne '' }
 
-        # Expected structure: Vendor\PackageName\Version\Type\Build\...\file.vbs
-        # Minimum segments needed: Vendor(0), PackageName(1), Version(2), Type(3), Build(4), file(5+)
         if ($Segments.Count -ge 5) {
-            $Result.PackageName = $Segments[1]  # PackageName is at index 1
-            $Result.Version = $Segments[2]      # Version is at index 2
-            $Result.Build = $Segments[4]        # Build is at index 4 (after Type)
-
+            $Result.PackageName = $Segments[1]
+            $Result.Version = $Segments[2]
+            $Result.Build = $Segments[4]
             Write-CMTraceLog -Message "Extracted metadata - Package: $($Result.PackageName), Version: $($Result.Version), Build: $($Result.Build) from $FullPath" -Component "ArchiveMetadata"
         }
         else {
@@ -271,13 +242,678 @@ function Open-FileInNotepad {
         Write-CMTraceLog -Message "Error opening file: $($_.Exception.Message)" -Severity 3 -Component "OpenFile"
     }
 }
+
+function Open-FileInExplorer {
+    param([string]$FilePath)
+    try {
+        if (Test-Path -LiteralPath $FilePath -PathType Leaf) {
+            Start-Process -FilePath "explorer.exe" -ArgumentList "/select,`"$FilePath`""
+            Write-CMTraceLog -Message "Opened Explorer at: $FilePath" -Component "OpenExplorer"
+        }
+        else {
+            $ParentFolder = Split-Path -Path $FilePath -Parent
+            if (Test-Path -Path $ParentFolder) {
+                Start-Process -FilePath "explorer.exe" -ArgumentList "`"$ParentFolder`""
+            }
+        }
+    }
+    catch {
+        Write-CMTraceLog -Message "Error opening Explorer: $($_.Exception.Message)" -Severity 3 -Component "OpenExplorer"
+    }
+}
+#endregion
+
+#region ===== MSI/MST SCANNING FUNCTIONS =====
+function New-MsiFinding {
+    <#
+    .SYNOPSIS
+        Creates a new MSI finding object.
+    #>
+    param(
+        [string]$InstallerPath,
+        [string]$FileType,
+        [string]$ProductName,
+        [string]$ProductVersion,
+        [string]$ProductCode,
+        [string]$FindingCategory,
+        [string]$TableOrSource,
+        [string]$ItemName,
+        [string]$Evidence,
+        [string]$Severity = "Info"
+    )
+
+    return [PSCustomObject]@{
+        InstallerPath   = $InstallerPath
+        FileType        = $FileType
+        ProductName     = $ProductName
+        ProductVersion  = $ProductVersion
+        ProductCode     = $ProductCode
+        FindingCategory = $FindingCategory
+        TableOrSource   = $TableOrSource
+        ItemName        = $ItemName
+        Evidence        = $Evidence
+        Severity        = $Severity
+    }
+}
+
+function Get-MsiProductInfo {
+    <#
+    .SYNOPSIS
+        Extracts product information from MSI Property table.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        $Database,
+        [string]$MsiPath
+    )
+
+    $ProductInfo = @{
+        ProductName    = ""
+        ProductVersion = ""
+        ProductCode    = ""
+    }
+
+    try {
+        $Query = "SELECT Property, Value FROM Property WHERE Property IN ('ProductName', 'ProductVersion', 'ProductCode')"
+        $View = $Database.OpenView($Query)
+        $View.Execute()
+
+        $Record = $View.Fetch()
+        while ($null -ne $Record) {
+            $PropName = $Record.StringData(1)
+            $PropValue = $Record.StringData(2)
+
+            switch ($PropName) {
+                "ProductName" { $ProductInfo.ProductName = $PropValue }
+                "ProductVersion" { $ProductInfo.ProductVersion = $PropValue }
+                "ProductCode" { $ProductInfo.ProductCode = $PropValue }
+            }
+            $Record = $View.Fetch()
+        }
+        $View.Close()
+    }
+    catch {
+        Write-CMTraceLog -Message "Error reading Property table from $MsiPath - $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+    }
+
+    return $ProductInfo
+}
+
+function Find-VBScriptCustomActions {
+    <#
+    .SYNOPSIS
+        Detects VBScript-related custom actions in MSI CustomAction table.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        $Database,
+        [string]$MsiPath,
+        [hashtable]$ProductInfo
+    )
+
+    $Findings = [System.Collections.ArrayList]::new()
+
+    # VBScript CA types:
+    # Type 6 = VBScript stored in Binary table
+    # Type 38 = VBScript stored in Binary table (deferred)
+    # Type 22 = VBScript stored in Binary table (commit)
+    # Type 54 = VBScript stored in Binary table (rollback)
+    # Type 37, 53 = JScript variations
+    $VBScriptTypes = @(6, 22, 38, 54)
+    $ScriptIndicators = @("cscript", "wscript", ".vbs", "vbscript", "script.exe")
+
+    try {
+        Write-CMTraceLog -Message "Querying CustomAction table in $MsiPath" -Component "MSIScan"
+        $Query = "SELECT Action, Type, Source, Target FROM CustomAction"
+        $View = $Database.OpenView($Query)
+        $View.Execute()
+
+        $Record = $View.Fetch()
+        while ($null -ne $Record) {
+            $ActionName = $Record.StringData(1)
+            $ActionType = $Record.IntegerData(2)
+            $Source = $Record.StringData(3)
+            $Target = $Record.StringData(4)
+
+            # Check for VBScript type custom actions
+            $BaseType = $ActionType -band 63  # Mask to get base type
+            if ($VBScriptTypes -contains $BaseType) {
+                $Finding = New-MsiFinding -InstallerPath $MsiPath `
+                    -FileType "MSI" `
+                    -ProductName $ProductInfo.ProductName `
+                    -ProductVersion $ProductInfo.ProductVersion `
+                    -ProductCode $ProductInfo.ProductCode `
+                    -FindingCategory "VBScriptCustomAction" `
+                    -TableOrSource "CustomAction" `
+                    -ItemName $ActionName `
+                    -Evidence "Type=$ActionType (VBS), Source=$Source" `
+                    -Severity "High"
+                $null = $Findings.Add($Finding)
+                Write-CMTraceLog -Message "Found VBScript CA: $ActionName (Type $ActionType)" -Component "MSIScan"
+            }
+
+            # Check Target field for script host invocations
+            if ($Target) {
+                $TargetLower = $Target.ToLower()
+                foreach ($Indicator in $ScriptIndicators) {
+                    if ($TargetLower -contains $Indicator) {
+                        $Evidence = if ($Target.Length -gt 100) { $Target.Substring(0, 100) + "..." } else { $Target }
+                        $Finding = New-MsiFinding -InstallerPath $MsiPath `
+                            -FileType "MSI" `
+                            -ProductName $ProductInfo.ProductName `
+                            -ProductVersion $ProductInfo.ProductVersion `
+                            -ProductCode $ProductInfo.ProductCode `
+                            -FindingCategory "ScriptHostInvocation" `
+                            -TableOrSource "CustomAction" `
+                            -ItemName $ActionName `
+                            -Evidence "Target contains '$Indicator': $Evidence" `
+                            -Severity "Warning"
+                        $null = $Findings.Add($Finding)
+                        Write-CMTraceLog -Message "Found script invocation in CA target: $ActionName - $Indicator" -Component "MSIScan"
+                        break
+                    }
+                }
+            }
+
+            $Record = $View.Fetch()
+        }
+        $View.Close()
+    }
+    catch {
+        Write-CMTraceLog -Message "Error querying CustomAction table: $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+    }
+
+    return $Findings
+}
+
+function Find-ActiveSetupIndicators {
+    <#
+    .SYNOPSIS
+        Detects Active Setup registry entries that may invoke scripts.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        $Database,
+        [string]$MsiPath,
+        [hashtable]$ProductInfo
+    )
+
+    $Findings = [System.Collections.ArrayList]::new()
+    $ActiveSetupPattern = "Active Setup\\Installed Components"
+    $ScriptIndicators = @("cscript", "wscript", ".vbs", "script")
+
+    try {
+        Write-CMTraceLog -Message "Querying Registry table for Active Setup in $MsiPath" -Component "MSIScan"
+        $Query = "SELECT Registry, Root, Key, Name, Value FROM Registry"
+        $View = $Database.OpenView($Query)
+        $View.Execute()
+
+        $Record = $View.Fetch()
+        while ($null -ne $Record) {
+            $RegistryKey = $Record.StringData(1)
+            $Root = $Record.IntegerData(2)
+            $Key = $Record.StringData(3)
+            $Name = $Record.StringData(4)
+            $Value = $Record.StringData(5)
+
+            # Check if this is an Active Setup key
+            if ($Key -and $Key -like "*$ActiveSetupPattern*") {
+                # Check StubPath or other values for script indicators
+                if ($Name -ieq "StubPath" -or $Value) {
+                    $ValueCheck = if ($Value) { $Value.ToLower() } else { "" }
+                    $FoundIndicator = $false
+
+                    foreach ($Indicator in $ScriptIndicators) {
+                        if ($ValueCheck -contains $Indicator) {
+                            $FoundIndicator = $true
+                            $Evidence = "Key=$Key, Name=$Name, Value=$Value"
+                            if ($Evidence.Length -gt 150) { $Evidence = $Evidence.Substring(0, 150) + "..." }
+
+                            $Finding = New-MsiFinding -InstallerPath $MsiPath `
+                                -FileType "MSI" `
+                                -ProductName $ProductInfo.ProductName `
+                                -ProductVersion $ProductInfo.ProductVersion `
+                                -ProductCode $ProductInfo.ProductCode `
+                                -FindingCategory "ActiveSetupStubPath" `
+                                -TableOrSource "Registry" `
+                                -ItemName "$Name in $RegistryKey" `
+                                -Evidence $Evidence `
+                                -Severity "High"
+                            $null = $Findings.Add($Finding)
+                            Write-CMTraceLog -Message "Found Active Setup script indicator: $Name = $Indicator" -Component "MSIScan"
+                            break
+                        }
+                    }
+
+                    # Also flag Active Setup entries even without script indicators (for awareness)
+                    if (-not $FoundIndicator -and $Name -ieq "StubPath") {
+                        $Evidence = "StubPath=$Value"
+                        if ($Evidence.Length -gt 150) { $Evidence = $Evidence.Substring(0, 150) + "..." }
+
+                        $Finding = New-MsiFinding -InstallerPath $MsiPath `
+                            -FileType "MSI" `
+                            -ProductName $ProductInfo.ProductName `
+                            -ProductVersion $ProductInfo.ProductVersion `
+                            -ProductCode $ProductInfo.ProductCode `
+                            -FindingCategory "ActiveSetupStubPath" `
+                            -TableOrSource "Registry" `
+                            -ItemName "$Name in $RegistryKey" `
+                            -Evidence $Evidence `
+                            -Severity "Info"
+                        $null = $Findings.Add($Finding)
+                    }
+                }
+            }
+
+            $Record = $View.Fetch()
+        }
+        $View.Close()
+    }
+    catch {
+        Write-CMTraceLog -Message "Error querying Registry table: $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+    }
+
+    return $Findings
+}
+
+function Find-BinaryScriptContent {
+    <#
+    .SYNOPSIS
+        Deep scans Binary table streams for VBScript content markers.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        $Database,
+        [string]$MsiPath,
+        [hashtable]$ProductInfo
+    )
+
+    $Findings = [System.Collections.ArrayList]::new()
+    $VBScriptMarkers = @(
+        "WScript.",
+        "CreateObject(",
+        "Scripting.FileSystemObject",
+        "On Error Resume Next",
+        "WScript.Shell",
+        "WScript.Network",
+        "ADODB.Connection",
+        "Scripting.Dictionary"
+    )
+
+    try {
+        Write-CMTraceLog -Message "Deep scanning Binary table in $MsiPath" -Component "MSIScan"
+        $Query = "SELECT Name, Data FROM Binary"
+        $View = $Database.OpenView($Query)
+        $View.Execute()
+
+        $TempFolder = [System.IO.Path]::GetTempPath()
+
+        $Record = $View.Fetch()
+        while ($null -ne $Record) {
+            $BinaryName = $Record.StringData(1)
+            $TempFile = Join-Path -Path $TempFolder -ChildPath "msi_binary_$([Guid]::NewGuid().ToString('N')).tmp"
+
+            try {
+                # Extract binary stream to temp file
+                $Record.SetStream(2, $TempFile)
+
+                # Read and scan for markers
+                if (Test-Path -Path $TempFile) {
+                    $Content = ""
+                    try {
+                        # Try to read as text (may fail for binary data)
+                        $Bytes = [System.IO.File]::ReadAllBytes($TempFile)
+                        if ($Bytes.Length -lt 1MB) {  # Only scan files under 1MB
+                            # Try UTF8, then ASCII
+                            try {
+                                $Content = [System.Text.Encoding]::UTF8.GetString($Bytes)
+                            }
+                            catch {
+                                $Content = [System.Text.Encoding]::ASCII.GetString($Bytes)
+                            }
+
+                            foreach ($Marker in $VBScriptMarkers) {
+                                if ($Content -like "*$Marker*") {
+                                    # Extract snippet around the marker
+                                    $Index = $Content.IndexOf($Marker, [StringComparison]::OrdinalIgnoreCase)
+                                    $Start = [Math]::Max(0, $Index - 20)
+                                    $Length = [Math]::Min(80, $Content.Length - $Start)
+                                    $Snippet = $Content.Substring($Start, $Length) -replace '[\r\n\t]', ' '
+                                    if ($Snippet.Length -gt 80) { $Snippet = $Snippet.Substring(0, 80) + "..." }
+
+                                    $Finding = New-MsiFinding -InstallerPath $MsiPath `
+                                        -FileType "MSI" `
+                                        -ProductName $ProductInfo.ProductName `
+                                        -ProductVersion $ProductInfo.ProductVersion `
+                                        -ProductCode $ProductInfo.ProductCode `
+                                        -FindingCategory "EmbeddedScriptText" `
+                                        -TableOrSource "Binary" `
+                                        -ItemName $BinaryName `
+                                        -Evidence "Contains '$Marker': $Snippet" `
+                                        -Severity "Warning"
+                                    $null = $Findings.Add($Finding)
+                                    Write-CMTraceLog -Message "Found embedded script marker in Binary '$BinaryName': $Marker" -Component "MSIScan"
+                                    break  # Only report first marker per binary
+                                }
+                            }
+                        }
+                    }
+                    catch {
+                        # Binary data that can't be decoded as text - skip silently
+                    }
+                }
+            }
+            catch {
+                Write-CMTraceLog -Message "Error extracting Binary '$BinaryName': $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+            }
+            finally {
+                if (Test-Path -Path $TempFile) {
+                    Remove-Item -Path $TempFile -Force -ErrorAction SilentlyContinue
+                }
+            }
+
+            $Record = $View.Fetch()
+        }
+        $View.Close()
+    }
+    catch {
+        Write-CMTraceLog -Message "Error querying Binary table: $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+    }
+
+    return $Findings
+}
+
+function Scan-MsiFile {
+    <#
+    .SYNOPSIS
+        Scans a single MSI file for VBScript indicators.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MsiPath,
+        [bool]$DeepScanBinary = $false,
+        [bool]$DetectActiveSetup = $true
+    )
+
+    $Findings = [System.Collections.ArrayList]::new()
+
+    Write-CMTraceLog -Message "Opening MSI for scanning: $MsiPath" -Component "MSIScan"
+
+    $Installer = $null
+    $Database = $null
+
+    try {
+        # Create Windows Installer COM object
+        $Installer = New-Object -ComObject WindowsInstaller.Installer
+
+        # Open database read-only (mode 0)
+        $Database = $Installer.OpenDatabase($MsiPath, 0)
+
+        # Get product information
+        $ProductInfo = Get-MsiProductInfo -Database $Database -MsiPath $MsiPath
+        Write-CMTraceLog -Message "MSI Product: $($ProductInfo.ProductName) v$($ProductInfo.ProductVersion)" -Component "MSIScan"
+
+        # Find VBScript custom actions
+        $CAFindings = Find-VBScriptCustomActions -Database $Database -MsiPath $MsiPath -ProductInfo $ProductInfo
+        foreach ($F in $CAFindings) { $null = $Findings.Add($F) }
+
+        # Find Active Setup indicators
+        if ($DetectActiveSetup) {
+            $ASFindings = Find-ActiveSetupIndicators -Database $Database -MsiPath $MsiPath -ProductInfo $ProductInfo
+            foreach ($F in $ASFindings) { $null = $Findings.Add($F) }
+        }
+
+        # Deep scan Binary table
+        if ($DeepScanBinary) {
+            $BinaryFindings = Find-BinaryScriptContent -Database $Database -MsiPath $MsiPath -ProductInfo $ProductInfo
+            foreach ($F in $BinaryFindings) { $null = $Findings.Add($F) }
+        }
+    }
+    catch {
+        Write-CMTraceLog -Message "Error scanning MSI $MsiPath - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
+        $Script:MsiErrorCount++
+    }
+    finally {
+        # Release COM objects
+        if ($null -ne $Database) {
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Database) | Out-Null
+        }
+        if ($null -ne $Installer) {
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Installer) | Out-Null
+        }
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    }
+
+    return $Findings
+}
+
+function Scan-MstFile {
+    <#
+    .SYNOPSIS
+        Scans an MST (transform) file for VBScript indicator strings.
+        MST files are binary and cannot be fully parsed without applying to an MSI,
+        so we do a simple string search.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MstPath
+    )
+
+    $Findings = [System.Collections.ArrayList]::new()
+    $Indicators = @("cscript", "wscript", ".vbs", "Active Setup", "StubPath", "WScript.", "CreateObject", "vbscript")
+
+    Write-CMTraceLog -Message "Scanning MST file: $MstPath" -Component "MSIScan"
+
+    try {
+        $Bytes = [System.IO.File]::ReadAllBytes($MstPath)
+        if ($Bytes.Length -lt 10MB) {  # Only scan files under 10MB
+            # Try to extract readable strings
+            $Content = ""
+            try {
+                $Content = [System.Text.Encoding]::Unicode.GetString($Bytes)
+            }
+            catch {
+                try {
+                    $Content = [System.Text.Encoding]::ASCII.GetString($Bytes)
+                }
+                catch {
+                    $Content = ""
+                }
+            }
+
+            if ($Content) {
+                foreach ($Indicator in $Indicators) {
+                    if ($Content -like "*$Indicator*") {
+                        $Finding = New-MsiFinding -InstallerPath $MstPath `
+                            -FileType "MST" `
+                            -ProductName "(Transform)" `
+                            -ProductVersion "" `
+                            -ProductCode "" `
+                            -FindingCategory "TransformStringIndicator" `
+                            -TableOrSource "FileContent" `
+                            -ItemName "String Match" `
+                            -Evidence "Contains string: '$Indicator'" `
+                            -Severity "Info"
+                        $null = $Findings.Add($Finding)
+                        Write-CMTraceLog -Message "Found indicator in MST: $Indicator" -Component "MSIScan"
+                    }
+                }
+            }
+        }
+        else {
+            Write-CMTraceLog -Message "MST file too large for string scanning: $MstPath" -Severity 2 -Component "MSIScan"
+        }
+    }
+    catch {
+        Write-CMTraceLog -Message "Error scanning MST $MstPath - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
+        $Script:MsiErrorCount++
+    }
+
+    return $Findings
+}
+
+function Start-MsiMstScan {
+    <#
+    .SYNOPSIS
+        Main MSI/MST scanning function that enumerates and scans installer files.
+    #>
+    param(
+        [string]$ScanRoot,
+        [bool]$Recurse = $true,
+        [string[]]$ExcludePaths = @(),
+        [bool]$ScanMsi = $true,
+        [bool]$ScanMst = $true,
+        [bool]$DeepScanBinary = $false,
+        [bool]$DetectActiveSetup = $true,
+        [string]$ExtensionFilter = ".msi;.mst",
+        [System.Windows.Forms.ProgressBar]$ProgressBar,
+        [System.Windows.Forms.Label]$StatusLabel,
+        [System.Windows.Forms.DataGridView]$DataGrid,
+        [System.Windows.Forms.Form]$ParentForm
+    )
+
+    $Script:MsiScanResults.Clear()
+    $Script:MsiErrorCount = 0
+    $Script:MsiFilesScanned = 0
+    $Script:MsiFilesWithFindings = 0
+    $Script:ScanCancelled = $false
+    $DataGrid.Rows.Clear()
+
+    $Extensions = @()
+    if ($ScanMsi) { $Extensions += ".msi" }
+    if ($ScanMst) { $Extensions += ".mst" }
+
+    if ($Extensions.Count -eq 0) {
+        $StatusLabel.Text = "No file types selected for scanning"
+        return $false
+    }
+
+    # Validate root path
+    if (-not (Test-PathAccessible -Path $ScanRoot)) {
+        Write-CMTraceLog -Message "Cannot access scan root: $ScanRoot" -Severity 3 -Component "MSIScan"
+        $StatusLabel.Text = "Error: Cannot access $ScanRoot"
+        $StatusLabel.ForeColor = [System.Drawing.Color]::Red
+        return $false
+    }
+
+    Write-CMTraceLog -Message "Starting MSI/MST scan - Root: $ScanRoot | Recurse: $Recurse | Extensions: $($Extensions -join ',')" -Component "MSIScan"
+    Write-CMTraceLog -Message "Options - ScanMsi: $ScanMsi | ScanMst: $ScanMst | DeepBinary: $DeepScanBinary | ActiveSetup: $DetectActiveSetup" -Component "MSIScan"
+
+    $ProgressBar.Style = "Marquee"
+    $ProgressBar.MarqueeAnimationSpeed = 30
+
+    $DirsToProcess = [System.Collections.Queue]::new()
+    $DirsToProcess.Enqueue($ScanRoot)
+    $DirCount = 0
+    $FileCount = 0
+    $LastUIUpdate = Get-Date
+
+    while ($DirsToProcess.Count -gt 0) {
+        if ($Script:ScanCancelled) {
+            Write-CMTraceLog -Message "MSI/MST scan cancelled by user" -Severity 2 -Component "MSIScan"
+            $StatusLabel.Text = "Scan cancelled"
+            $StatusLabel.ForeColor = [System.Drawing.Color]::Orange
+            $ProgressBar.Style = "Continuous"
+            return $false
+        }
+
+        $CurrentPath = $DirsToProcess.Dequeue()
+        $DirCount++
+
+        if (Test-PathExcluded -Path $CurrentPath -ExcludePaths $ExcludePaths) {
+            continue
+        }
+
+        # Update UI periodically
+        $Now = Get-Date
+        if (($Now - $LastUIUpdate).TotalMilliseconds -ge 100) {
+            $ShortPath = if ($CurrentPath.Length -gt 50) { "..." + $CurrentPath.Substring($CurrentPath.Length - 47) } else { $CurrentPath }
+            $StatusLabel.Text = "MSI: $($Script:MsiFilesScanned) | Findings: $($Script:MsiScanResults.Count) | $ShortPath"
+            [System.Windows.Forms.Application]::DoEvents()
+            $LastUIUpdate = $Now
+        }
+
+        try {
+            $Items = Get-ChildItem -LiteralPath $CurrentPath -Force -ErrorAction Stop
+
+            foreach ($Item in $Items) {
+                if ($Script:ScanCancelled) { break }
+
+                if ($Item.PSIsContainer) {
+                    if ($Recurse -and -not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                        $DirsToProcess.Enqueue($Item.FullName)
+                    }
+                }
+                else {
+                    $ExtLower = $Item.Extension.ToLower()
+                    if ($Extensions -contains $ExtLower) {
+                        $FileCount++
+                        $Script:MsiFilesScanned++
+
+                        $Findings = @()
+                        if ($ExtLower -eq ".msi") {
+                            $Findings = Scan-MsiFile -MsiPath $Item.FullName -DeepScanBinary $DeepScanBinary -DetectActiveSetup $DetectActiveSetup
+                        }
+                        elseif ($ExtLower -eq ".mst") {
+                            $Findings = Scan-MstFile -MstPath $Item.FullName
+                        }
+
+                        if ($Findings.Count -gt 0) {
+                            $Script:MsiFilesWithFindings++
+                            foreach ($Finding in $Findings) {
+                                $null = $Script:MsiScanResults.Add($Finding)
+
+                                # Add to grid
+                                $SeverityColor = switch ($Finding.Severity) {
+                                    "High" { [System.Drawing.Color]::Red }
+                                    "Warning" { [System.Drawing.Color]::DarkOrange }
+                                    default { [System.Drawing.Color]::Black }
+                                }
+
+                                $RowIndex = $DataGrid.Rows.Add(
+                                    $Finding.InstallerPath,
+                                    $Finding.FileType,
+                                    $Finding.ProductName,
+                                    $Finding.ProductVersion,
+                                    $Finding.FindingCategory,
+                                    $Finding.TableOrSource,
+                                    $Finding.ItemName,
+                                    $Finding.Evidence,
+                                    $Finding.Severity
+                                )
+
+                                # Color the severity cell
+                                $DataGrid.Rows[$RowIndex].Cells["Severity"].Style.ForeColor = $SeverityColor
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch [System.UnauthorizedAccessException] {
+            $Script:MsiErrorCount++
+            Write-CMTraceLog -Message "Access denied: $CurrentPath" -Severity 3 -Component "MSIScan"
+        }
+        catch {
+            $Script:MsiErrorCount++
+            Write-CMTraceLog -Message "Error scanning $CurrentPath - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
+        }
+    }
+
+    $ProgressBar.Style = "Continuous"
+    $ProgressBar.Value = 100
+
+    Write-CMTraceLog -Message "MSI/MST scan complete. Scanned: $($Script:MsiFilesScanned) files, Findings: $($Script:MsiScanResults.Count), Errors: $($Script:MsiErrorCount)" -Component "MSIScan"
+    return $true
+}
 #endregion
 
 #region ===== HTML REPORT GENERATION =====
 function New-HtmlReport {
     <#
     .SYNOPSIS
-        Generates an HTML report with Phase 2 enhancements for Archive metadata.
+        Generates an HTML report for VBS file scan results.
     #>
     param(
         [array]$Results,
@@ -298,7 +934,6 @@ function New-HtmlReport {
     $PackageSummaryHtml = ""
     if ($EntryType -eq "ArchiveRoot" -and $Results.Count -gt 0) {
         $PackageGroups = $Results | Where-Object { $_.PackageName -ne "" } | Group-Object -Property PackageName | Sort-Object Count -Descending
-        $VersionGroups = $Results | Where-Object { $_.Version -ne "" } | Group-Object -Property Version | Sort-Object Count -Descending
 
         if ($PackageGroups.Count -gt 0) {
             $PackageRows = ""
@@ -318,7 +953,7 @@ function New-HtmlReport {
         }
     }
 
-    # Build table rows with new columns
+    # Build table rows
     $TableRows = ""
     $RowNumber = 0
     foreach ($File in $Results) {
@@ -333,7 +968,6 @@ function New-HtmlReport {
         $FormattedDate = $File.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
         $FormattedSize = "{0:N0}" -f $File.SizeBytes
 
-        # Create file:// link - WebBrowser.Navigating will intercept this
         $FileUri = "file:///" + ($File.FullPath -replace '\\', '/')
 
         $TableRows += @"
@@ -352,7 +986,6 @@ function New-HtmlReport {
 "@
     }
 
-    # Entry type display name
     $EntryTypeDisplay = switch ($EntryType) {
         "DeviceName" { "Device/Local Path" }
         "UNC" { "UNC Path" }
@@ -411,6 +1044,7 @@ function New-HtmlReport {
         }
         .summary-card.success { border-left-color: var(--success); }
         .summary-card.error { border-left-color: var(--error); }
+        .summary-card.warning { border-left-color: var(--warning); }
         .summary-card .label { font-size: 11px; text-transform: uppercase; color: #605e5c; }
         .summary-card .value { font-size: 20px; font-weight: 600; }
         .info-box {
@@ -452,13 +1086,16 @@ function New-HtmlReport {
         .no-results { text-align: center; padding: 30px; color: #605e5c; font-style: italic; }
         .note { background: #fff4ce; border: 1px solid var(--warning); border-radius: 4px; padding: 10px; margin-bottom: 15px; font-size: 12px; }
         .archive-badge { background: #e0f0ff; color: #0078d4; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-left: 8px; }
+        .severity-high { color: #d83b01; font-weight: bold; }
+        .severity-warning { color: #ffb900; font-weight: bold; }
+        .severity-info { color: #107c10; }
         footer { margin-top: 15px; text-align: center; color: #605e5c; font-size: 11px; }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>VBS Scanner Report $(if ($EntryType -eq 'ArchiveRoot') { '<span class="archive-badge">Archive Scan</span>' })</h1>
+            <h1>VBS File Scan Report $(if ($EntryType -eq 'ArchiveRoot') { '<span class="archive-badge">Archive Scan</span>' })</h1>
             <div class="subtitle">Generated: $($EndTime.ToString("yyyy-MM-dd HH:mm:ss")) | VBS Scanner Utility v$Script:AppVersion</div>
         </header>
 
@@ -483,6 +1120,7 @@ function New-HtmlReport {
 
         <div class="info-box">
             <h2>Scan Details</h2>
+            <p><strong>Scan Mode:</strong> VBS File Scan</p>
             <p><strong>Entry Type:</strong> $EntryTypeDisplay</p>
             <p><strong>Scan Root:</strong> $([System.Web.HttpUtility]::HtmlEncode($ScanRoot))</p>
             <p><strong>Start Time:</strong> $($StartTime.ToString("yyyy-MM-dd HH:mm:ss"))</p>
@@ -540,14 +1178,285 @@ function New-HtmlReport {
         return $false
     }
 }
-#endregion
 
-#region ===== SCAN FUNCTION =====
-function Start-VbsScan {
+function New-MsiHtmlReport {
     <#
     .SYNOPSIS
-        Scans for .vbs files with Phase 2 Archive metadata extraction support.
+        Generates an HTML report for MSI/MST scan findings.
     #>
+    param(
+        [array]$Findings,
+        [string]$ScanRoot,
+        [datetime]$StartTime,
+        [datetime]$EndTime,
+        [int]$ErrorCount,
+        [int]$FilesScanned,
+        [int]$FilesWithFindings,
+        [string]$OutputPath
+    )
+
+    $Duration = $EndTime - $StartTime
+    $DurationString = "{0:hh\:mm\:ss\.fff}" -f $Duration
+
+    # Count by category
+    $CategoryCounts = $Findings | Group-Object -Property FindingCategory | Sort-Object Count -Descending
+
+    $CategorySummaryHtml = ""
+    if ($CategoryCounts.Count -gt 0) {
+        $CategoryRows = ""
+        foreach ($Cat in $CategoryCounts) {
+            $CategoryRows += "<tr><td>$([System.Web.HttpUtility]::HtmlEncode($Cat.Name))</td><td class='size-cell'>$($Cat.Count)</td></tr>"
+        }
+        $CategorySummaryHtml = @"
+        <div class="info-box">
+            <h2>Findings by Category</h2>
+            <table style="width: auto; min-width: 300px;">
+                <thead><tr><th>Category</th><th>Count</th></tr></thead>
+                <tbody>$CategoryRows</tbody>
+            </table>
+        </div>
+"@
+    }
+
+    # Count by severity
+    $HighCount = ($Findings | Where-Object { $_.Severity -eq "High" }).Count
+    $WarningCount = ($Findings | Where-Object { $_.Severity -eq "Warning" }).Count
+    $InfoCount = ($Findings | Where-Object { $_.Severity -eq "Info" }).Count
+
+    # Build table rows
+    $TableRows = ""
+    $RowNumber = 0
+    foreach ($Finding in $Findings) {
+        $RowNumber++
+        $RowClass = if ($RowNumber % 2 -eq 0) { "even" } else { "odd" }
+
+        $SafePath = [System.Web.HttpUtility]::HtmlEncode($Finding.InstallerPath)
+        $SafeProductName = [System.Web.HttpUtility]::HtmlEncode($Finding.ProductName)
+        $SafeCategory = [System.Web.HttpUtility]::HtmlEncode($Finding.FindingCategory)
+        $SafeTableSource = [System.Web.HttpUtility]::HtmlEncode($Finding.TableOrSource)
+        $SafeItemName = [System.Web.HttpUtility]::HtmlEncode($Finding.ItemName)
+        $SafeEvidence = [System.Web.HttpUtility]::HtmlEncode($Finding.Evidence)
+
+        $SeverityClass = switch ($Finding.Severity) {
+            "High" { "severity-high" }
+            "Warning" { "severity-warning" }
+            default { "severity-info" }
+        }
+
+        # Create explorer link (select file, don't execute)
+        $ExplorerUri = "explorer:/select/$($Finding.InstallerPath -replace '\\', '/')"
+
+        $TableRows += @"
+
+        <tr class="$RowClass">
+            <td class="row-num">$RowNumber</td>
+            <td class="path-cell"><a href="$ExplorerUri" title="Open in Explorer">$SafePath</a></td>
+            <td>$($Finding.FileType)</td>
+            <td>$SafeProductName</td>
+            <td>$($Finding.ProductVersion)</td>
+            <td>$SafeCategory</td>
+            <td>$SafeTableSource</td>
+            <td>$SafeItemName</td>
+            <td style="max-width:200px; word-break:break-all;">$SafeEvidence</td>
+            <td class="$SeverityClass">$($Finding.Severity)</td>
+        </tr>
+"@
+    }
+
+    $HtmlContent = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MSI/MST VBScript Indicator Report</title>
+    <style>
+        :root {
+            --primary: #0078d4;
+            --success: #107c10;
+            --warning: #ffb900;
+            --error: #d83b01;
+            --bg: #f3f2f1;
+            --card: #ffffff;
+            --text: #323130;
+            --border: #e1dfdd;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', Tahoma, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+            padding: 15px;
+        }
+        .container { max-width: 1600px; margin: 0 auto; }
+        header {
+            background: linear-gradient(135deg, #8b0000, #dc143c);
+            color: white;
+            padding: 20px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+        }
+        header h1 { font-size: 22px; margin-bottom: 5px; }
+        header .subtitle { opacity: 0.9; font-size: 12px; }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .summary-card {
+            background: var(--card);
+            border-radius: 6px;
+            padding: 15px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            border-left: 3px solid var(--primary);
+        }
+        .summary-card.success { border-left-color: var(--success); }
+        .summary-card.error { border-left-color: var(--error); }
+        .summary-card.warning { border-left-color: var(--warning); }
+        .summary-card .label { font-size: 11px; text-transform: uppercase; color: #605e5c; }
+        .summary-card .value { font-size: 20px; font-weight: 600; }
+        .info-box {
+            background: var(--card);
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 15px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .info-box h2 { font-size: 14px; color: var(--primary); margin-bottom: 10px; border-bottom: 1px solid var(--border); padding-bottom: 5px; }
+        .info-box p { font-size: 12px; margin: 3px 0; }
+        .results-box {
+            background: var(--card);
+            border-radius: 6px;
+            padding: 15px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            overflow-x: auto;
+        }
+        .results-box h2 { font-size: 14px; color: var(--primary); margin-bottom: 10px; }
+        table { width: 100%; border-collapse: collapse; font-size: 11px; }
+        th {
+            background: #8b0000;
+            color: white;
+            padding: 10px 6px;
+            text-align: left;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+        td { padding: 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+        tr.odd { background: #fafafa; }
+        tr.even { background: #ffffff; }
+        tr:hover { background: #ffe8e8; }
+        .row-num { text-align: center; color: #605e5c; width: 35px; }
+        .path-cell { max-width: 250px; word-break: break-all; }
+        .path-cell a { color: var(--primary); text-decoration: none; }
+        .path-cell a:hover { text-decoration: underline; cursor: pointer; }
+        .no-results { text-align: center; padding: 30px; color: #605e5c; font-style: italic; }
+        .severity-high { color: #d83b01; font-weight: bold; }
+        .severity-warning { color: #c87000; font-weight: bold; }
+        .severity-info { color: #107c10; }
+        .msi-badge { background: #8b0000; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-left: 8px; }
+        footer { margin-top: 15px; text-align: center; color: #605e5c; font-size: 11px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>MSI/MST VBScript Indicator Report <span class="msi-badge">Installer Scan</span></h1>
+            <div class="subtitle">Generated: $($EndTime.ToString("yyyy-MM-dd HH:mm:ss")) | VBS Scanner Utility v$Script:AppVersion</div>
+        </header>
+
+        <div class="summary-grid">
+            <div class="summary-card">
+                <div class="label">Files Scanned</div>
+                <div class="value">$FilesScanned</div>
+            </div>
+            <div class="summary-card $(if ($FilesWithFindings -gt 0) { 'warning' } else { 'success' })">
+                <div class="label">With Findings</div>
+                <div class="value">$FilesWithFindings</div>
+            </div>
+            <div class="summary-card">
+                <div class="label">Total Findings</div>
+                <div class="value">$($Findings.Count)</div>
+            </div>
+            <div class="summary-card error">
+                <div class="label">High Severity</div>
+                <div class="value">$HighCount</div>
+            </div>
+            <div class="summary-card warning">
+                <div class="label">Warnings</div>
+                <div class="value">$WarningCount</div>
+            </div>
+            <div class="summary-card $(if ($ErrorCount -gt 0) { 'error' } else { 'success' })">
+                <div class="label">Errors</div>
+                <div class="value">$ErrorCount</div>
+            </div>
+            <div class="summary-card">
+                <div class="label">Duration</div>
+                <div class="value">$DurationString</div>
+            </div>
+        </div>
+
+        <div class="info-box">
+            <h2>Scan Details</h2>
+            <p><strong>Scan Mode:</strong> MSI/MST VBScript Indicator Scan</p>
+            <p><strong>Scan Root:</strong> $([System.Web.HttpUtility]::HtmlEncode($ScanRoot))</p>
+            <p><strong>Start Time:</strong> $($StartTime.ToString("yyyy-MM-dd HH:mm:ss"))</p>
+            <p><strong>End Time:</strong> $($EndTime.ToString("yyyy-MM-dd HH:mm:ss"))</p>
+        </div>
+
+        $CategorySummaryHtml
+
+        <div class="results-box">
+            <h2>MSI/MST Findings ($($Findings.Count))</h2>
+            $(if ($Findings.Count -eq 0) {
+                '<div class="no-results">No VBScript indicators were found in the scanned installers.</div>'
+            } else {
+                @"
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Installer Path</th>
+                        <th>Type</th>
+                        <th>Product Name</th>
+                        <th>Version</th>
+                        <th>Category</th>
+                        <th>Table/Source</th>
+                        <th>Item Name</th>
+                        <th>Evidence</th>
+                        <th>Severity</th>
+                    </tr>
+                </thead>
+                <tbody>$TableRows
+                </tbody>
+            </table>
+"@
+            })
+        </div>
+
+        <footer>
+            <p>VBS Scanner Utility v$Script:AppVersion | MSI/MST VBScript Indicator Scanner | PowerShell $($PSVersionTable.PSVersion.ToString())</p>
+        </footer>
+    </div>
+</body>
+</html>
+"@
+
+    try {
+        Set-Content -Path $OutputPath -Value $HtmlContent -Encoding UTF8 -Force -ErrorAction Stop
+        Write-CMTraceLog -Message "MSI HTML report created: $OutputPath" -Component "MsiHtmlReport"
+        return $true
+    }
+    catch {
+        Write-CMTraceLog -Message "Failed to create MSI HTML report: $($_.Exception.Message)" -Severity 3 -Component "MsiHtmlReport"
+        return $false
+    }
+}
+#endregion
+
+#region ===== VBS SCAN FUNCTION =====
+function Start-VbsScan {
     param(
         [string]$ScanRoot,
         [string]$EntryType,
@@ -570,7 +1479,6 @@ function Start-VbsScan {
     $DirCount = 0
     $LastUIUpdate = Get-Date
 
-    # Validate root path
     if (-not (Test-PathAccessible -Path $ScanRoot)) {
         Write-CMTraceLog -Message "Cannot access scan root: $ScanRoot" -Severity 3 -Component "Scan"
         $StatusLabel.Text = "Error: Cannot access $ScanRoot"
@@ -578,13 +1486,12 @@ function Start-VbsScan {
         return $false
     }
 
-    Write-CMTraceLog -Message "Starting scan - EntryType: $EntryType | Root: $ScanRoot | Recurse: $Recurse" -Component "Scan"
+    Write-CMTraceLog -Message "Starting VBS scan - EntryType: $EntryType | Root: $ScanRoot | Recurse: $Recurse" -Component "Scan"
     $DirsToProcess.Enqueue($ScanRoot)
     $ProgressBar.Style = "Marquee"
     $ProgressBar.MarqueeAnimationSpeed = 30
 
     while ($DirsToProcess.Count -gt 0) {
-        # Check for cancellation
         if ($Script:ScanCancelled) {
             Write-CMTraceLog -Message "Scan cancelled by user" -Severity 2 -Component "Scan"
             $StatusLabel.Text = "Scan cancelled"
@@ -596,12 +1503,10 @@ function Start-VbsScan {
         $CurrentPath = $DirsToProcess.Dequeue()
         $DirCount++
 
-        # Check exclusions
         if (Test-PathExcluded -Path $CurrentPath -ExcludePaths $ExcludePaths) {
             continue
         }
 
-        # Update UI periodically (every 100ms) for responsiveness
         $Now = Get-Date
         if (($Now - $LastUIUpdate).TotalMilliseconds -ge 100) {
             $ShortPath = if ($CurrentPath.Length -gt 60) { "..." + $CurrentPath.Substring($CurrentPath.Length - 57) } else { $CurrentPath }
@@ -614,21 +1519,15 @@ function Start-VbsScan {
             $Items = Get-ChildItem -LiteralPath $CurrentPath -Force -ErrorAction Stop
 
             foreach ($Item in $Items) {
-                if ($Script:ScanCancelled) {
-                    break
-                }
+                if ($Script:ScanCancelled) { break }
 
                 if ($Item.PSIsContainer) {
-                    if ($Recurse) {
-                        # Skip reparse points
-                        if (-not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-                            $DirsToProcess.Enqueue($Item.FullName)
-                        }
+                    if ($Recurse -and -not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                        $DirsToProcess.Enqueue($Item.FullName)
                     }
                 }
                 else {
                     if ($Item.Extension -ieq ".vbs") {
-                        # Extract archive metadata if applicable
                         $PackageName = ""
                         $Version = ""
                         $Build = ""
@@ -653,7 +1552,6 @@ function Start-VbsScan {
                         $null = $Script:ScanResults.Add($FileInfo)
                         $FileCount++
 
-                        # Add to grid with new columns
                         $null = $DataGrid.Rows.Add(
                             $Item.Name,
                             $Item.FullName,
@@ -665,14 +1563,14 @@ function Start-VbsScan {
                             $Item.Length
                         )
 
-                        Write-CMTraceLog -Message "Found: $($Item.FullName) | Pkg: $PackageName | Ver: $Version | Build: $Build" -Component "Scan"
+                        Write-CMTraceLog -Message "Found: $($Item.FullName)" -Component "Scan"
                     }
                 }
             }
         }
         catch [System.UnauthorizedAccessException] {
             $Script:ErrorCount++
-            Write-CMTraceLog -Message "Access denied: $CurrentPath - $($_.Exception.Message)" -Severity 3 -Component "Scan"
+            Write-CMTraceLog -Message "Access denied: $CurrentPath" -Severity 3 -Component "Scan"
         }
         catch [System.IO.DirectoryNotFoundException] {
             $Script:ErrorCount++
@@ -686,7 +1584,7 @@ function Start-VbsScan {
 
     $ProgressBar.Style = "Continuous"
     $ProgressBar.Value = 100
-    Write-CMTraceLog -Message "Scan complete. Found $FileCount VBS files with $($Script:ErrorCount) errors" -Component "Scan"
+    Write-CMTraceLog -Message "VBS scan complete. Found $FileCount files with $($Script:ErrorCount) errors" -Component "Scan"
     return $true
 }
 #endregion
@@ -700,9 +1598,9 @@ function Build-MainForm {
     #region Main Form
     $MainForm = New-Object System.Windows.Forms.Form
     $MainForm.Text = "$Script:AppName v$Script:AppVersion"
-    $MainForm.Size = New-Object System.Drawing.Size(1300, 850)
+    $MainForm.Size = New-Object System.Drawing.Size(1400, 950)
     $MainForm.StartPosition = "CenterScreen"
-    $MainForm.MinimumSize = New-Object System.Drawing.Size(1100, 650)
+    $MainForm.MinimumSize = New-Object System.Drawing.Size(1200, 700)
     $MainForm.Font = New-Object System.Drawing.Font("Segoe UI", 9)
     $MainForm.Icon = [System.Drawing.SystemIcons]::Application
     #endregion
@@ -711,7 +1609,7 @@ function Build-MainForm {
     $SplitContainer = New-Object System.Windows.Forms.SplitContainer
     $SplitContainer.Dock = "Fill"
     $SplitContainer.Orientation = "Horizontal"
-    $SplitContainer.SplitterDistance = 350
+    $SplitContainer.SplitterDistance = 380
     $SplitContainer.Panel1MinSize = 200
     $SplitContainer.Panel2MinSize = 150
     #endregion
@@ -719,137 +1617,188 @@ function Build-MainForm {
     #region Top Panel - Input Controls
     $TopPanel = New-Object System.Windows.Forms.Panel
     $TopPanel.Dock = "Top"
-    $TopPanel.Height = 210
+    $TopPanel.Height = 250
     $TopPanel.Padding = New-Object System.Windows.Forms.Padding(10)
 
-    # GroupBox for Input Type - expanded for 3 options
+    # ========== SCAN MODE SELECTOR (NEW) ==========
+    $ScanModeGroupBox = New-Object System.Windows.Forms.GroupBox
+    $ScanModeGroupBox.Text = "Scan Mode"
+    $ScanModeGroupBox.Location = New-Object System.Drawing.Point(10, 10)
+    $ScanModeGroupBox.Size = New-Object System.Drawing.Size(200, 70)
+
+    $RadioVbsScan = New-Object System.Windows.Forms.RadioButton
+    $RadioVbsScan.Text = "VBS File Scan"
+    $RadioVbsScan.Location = New-Object System.Drawing.Point(15, 20)
+    $RadioVbsScan.Size = New-Object System.Drawing.Size(120, 20)
+    $RadioVbsScan.Checked = $true
+
+    $RadioMsiScan = New-Object System.Windows.Forms.RadioButton
+    $RadioMsiScan.Text = "MSI/MST Scan"
+    $RadioMsiScan.Location = New-Object System.Drawing.Point(15, 45)
+    $RadioMsiScan.Size = New-Object System.Drawing.Size(120, 20)
+
+    $ScanModeGroupBox.Controls.Add($RadioVbsScan)
+    $ScanModeGroupBox.Controls.Add($RadioMsiScan)
+
+    # ========== SCAN TARGET (existing) ==========
     $InputGroupBox = New-Object System.Windows.Forms.GroupBox
     $InputGroupBox.Text = "Scan Target"
-    $InputGroupBox.Location = New-Object System.Drawing.Point(10, 10)
-    $InputGroupBox.Size = New-Object System.Drawing.Size(620, 120)
+    $InputGroupBox.Location = New-Object System.Drawing.Point(220, 10)
+    $InputGroupBox.Size = New-Object System.Drawing.Size(550, 100)
 
-    # Radio 1: Device Name / Local Path
     $RadioDevice = New-Object System.Windows.Forms.RadioButton
     $RadioDevice.Text = "Device/Path:"
-    $RadioDevice.Location = New-Object System.Drawing.Point(15, 25)
-    $RadioDevice.Size = New-Object System.Drawing.Size(100, 20)
+    $RadioDevice.Location = New-Object System.Drawing.Point(15, 20)
+    $RadioDevice.Size = New-Object System.Drawing.Size(95, 20)
     $RadioDevice.Checked = $true
 
     $TxtDeviceName = New-Object System.Windows.Forms.TextBox
-    $TxtDeviceName.Location = New-Object System.Drawing.Point(120, 23)
+    $TxtDeviceName.Location = New-Object System.Drawing.Point(115, 18)
     $TxtDeviceName.Size = New-Object System.Drawing.Size(200, 23)
-    $TxtDeviceName.Text = ""
 
     $LblDeviceHint = New-Object System.Windows.Forms.Label
     $LblDeviceHint.Text = "(e.g., C:\temp or PC-123)"
-    $LblDeviceHint.Location = New-Object System.Drawing.Point(330, 26)
-    $LblDeviceHint.Size = New-Object System.Drawing.Size(280, 18)
+    $LblDeviceHint.Location = New-Object System.Drawing.Point(325, 21)
+    $LblDeviceHint.Size = New-Object System.Drawing.Size(200, 18)
     $LblDeviceHint.ForeColor = [System.Drawing.Color]::Gray
     $LblDeviceHint.Font = New-Object System.Drawing.Font("Segoe UI", 8)
 
-    # Radio 2: UNC Path
     $RadioUNC = New-Object System.Windows.Forms.RadioButton
     $RadioUNC.Text = "UNC Path:"
-    $RadioUNC.Location = New-Object System.Drawing.Point(15, 55)
-    $RadioUNC.Size = New-Object System.Drawing.Size(100, 20)
+    $RadioUNC.Location = New-Object System.Drawing.Point(15, 45)
+    $RadioUNC.Size = New-Object System.Drawing.Size(95, 20)
 
     $TxtUNCPath = New-Object System.Windows.Forms.TextBox
-    $TxtUNCPath.Location = New-Object System.Drawing.Point(120, 53)
-    $TxtUNCPath.Size = New-Object System.Drawing.Size(380, 23)
-    $TxtUNCPath.Text = ""
+    $TxtUNCPath.Location = New-Object System.Drawing.Point(115, 43)
+    $TxtUNCPath.Size = New-Object System.Drawing.Size(320, 23)
     $TxtUNCPath.Enabled = $false
 
-    $LblUNCHint = New-Object System.Windows.Forms.Label
-    $LblUNCHint.Text = "(e.g., \\server\share\folder)"
-    $LblUNCHint.Location = New-Object System.Drawing.Point(510, 56)
-    $LblUNCHint.Size = New-Object System.Drawing.Size(100, 18)
-    $LblUNCHint.ForeColor = [System.Drawing.Color]::Gray
-    $LblUNCHint.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-
-    # Radio 3: Archive Root (NEW in Phase 2)
     $RadioArchive = New-Object System.Windows.Forms.RadioButton
     $RadioArchive.Text = "Archive Root:"
-    $RadioArchive.Location = New-Object System.Drawing.Point(15, 85)
-    $RadioArchive.Size = New-Object System.Drawing.Size(100, 20)
+    $RadioArchive.Location = New-Object System.Drawing.Point(15, 70)
+    $RadioArchive.Size = New-Object System.Drawing.Size(95, 20)
 
     $TxtArchiveRoot = New-Object System.Windows.Forms.TextBox
-    $TxtArchiveRoot.Location = New-Object System.Drawing.Point(120, 83)
-    $TxtArchiveRoot.Size = New-Object System.Drawing.Size(380, 23)
-    $TxtArchiveRoot.Text = ""
+    $TxtArchiveRoot.Location = New-Object System.Drawing.Point(115, 68)
+    $TxtArchiveRoot.Size = New-Object System.Drawing.Size(320, 23)
     $TxtArchiveRoot.Enabled = $false
-
-    $LblArchiveHint = New-Object System.Windows.Forms.Label
-    $LblArchiveHint.Text = "(e.g., \\Server\Archive)"
-    $LblArchiveHint.Location = New-Object System.Drawing.Point(510, 86)
-    $LblArchiveHint.Size = New-Object System.Drawing.Size(100, 18)
-    $LblArchiveHint.ForeColor = [System.Drawing.Color]::Gray
-    $LblArchiveHint.Font = New-Object System.Drawing.Font("Segoe UI", 8)
 
     $InputGroupBox.Controls.Add($RadioDevice)
     $InputGroupBox.Controls.Add($TxtDeviceName)
     $InputGroupBox.Controls.Add($LblDeviceHint)
     $InputGroupBox.Controls.Add($RadioUNC)
     $InputGroupBox.Controls.Add($TxtUNCPath)
-    $InputGroupBox.Controls.Add($LblUNCHint)
     $InputGroupBox.Controls.Add($RadioArchive)
     $InputGroupBox.Controls.Add($TxtArchiveRoot)
-    $InputGroupBox.Controls.Add($LblArchiveHint)
 
-    # GroupBox for Options
-    $OptionsGroupBox = New-Object System.Windows.Forms.GroupBox
-    $OptionsGroupBox.Text = "Options"
-    $OptionsGroupBox.Location = New-Object System.Drawing.Point(640, 10)
-    $OptionsGroupBox.Size = New-Object System.Drawing.Size(620, 120)
+    # ========== VBS OPTIONS (existing) ==========
+    $VbsOptionsGroupBox = New-Object System.Windows.Forms.GroupBox
+    $VbsOptionsGroupBox.Text = "VBS Scan Options"
+    $VbsOptionsGroupBox.Location = New-Object System.Drawing.Point(780, 10)
+    $VbsOptionsGroupBox.Size = New-Object System.Drawing.Size(580, 100)
 
     $ChkRecurse = New-Object System.Windows.Forms.CheckBox
     $ChkRecurse.Text = "Recurse subdirectories"
-    $ChkRecurse.Location = New-Object System.Drawing.Point(15, 25)
+    $ChkRecurse.Location = New-Object System.Drawing.Point(15, 20)
     $ChkRecurse.Size = New-Object System.Drawing.Size(160, 20)
     $ChkRecurse.Checked = $true
 
     $LblExclude = New-Object System.Windows.Forms.Label
-    $LblExclude.Text = "Exclude paths (;-delimited):"
-    $LblExclude.Location = New-Object System.Drawing.Point(15, 55)
-    $LblExclude.Size = New-Object System.Drawing.Size(150, 18)
+    $LblExclude.Text = "Exclude paths:"
+    $LblExclude.Location = New-Object System.Drawing.Point(15, 50)
+    $LblExclude.Size = New-Object System.Drawing.Size(85, 18)
 
     $TxtExcludePaths = New-Object System.Windows.Forms.TextBox
-    $TxtExcludePaths.Location = New-Object System.Drawing.Point(170, 53)
-    $TxtExcludePaths.Size = New-Object System.Drawing.Size(430, 23)
+    $TxtExcludePaths.Location = New-Object System.Drawing.Point(105, 48)
+    $TxtExcludePaths.Size = New-Object System.Drawing.Size(460, 23)
 
-    # Archive structure info label
-    $LblArchiveInfo = New-Object System.Windows.Forms.Label
-    $LblArchiveInfo.Text = "Archive structure: \\Server\Archive\Vendor\PackageName\Version\Type\Build\"
-    $LblArchiveInfo.Location = New-Object System.Drawing.Point(15, 85)
-    $LblArchiveInfo.Size = New-Object System.Drawing.Size(590, 18)
-    $LblArchiveInfo.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
-    $LblArchiveInfo.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+    $LblExcludeHint = New-Object System.Windows.Forms.Label
+    $LblExcludeHint.Text = "(semicolon-delimited)"
+    $LblExcludeHint.Location = New-Object System.Drawing.Point(105, 73)
+    $LblExcludeHint.Size = New-Object System.Drawing.Size(150, 18)
+    $LblExcludeHint.ForeColor = [System.Drawing.Color]::Gray
+    $LblExcludeHint.Font = New-Object System.Drawing.Font("Segoe UI", 8)
 
-    $OptionsGroupBox.Controls.Add($ChkRecurse)
-    $OptionsGroupBox.Controls.Add($LblExclude)
-    $OptionsGroupBox.Controls.Add($TxtExcludePaths)
-    $OptionsGroupBox.Controls.Add($LblArchiveInfo)
+    $VbsOptionsGroupBox.Controls.Add($ChkRecurse)
+    $VbsOptionsGroupBox.Controls.Add($LblExclude)
+    $VbsOptionsGroupBox.Controls.Add($TxtExcludePaths)
+    $VbsOptionsGroupBox.Controls.Add($LblExcludeHint)
 
-    # Output Folder Selection
+    # ========== MSI/MST OPTIONS (NEW) ==========
+    $MsiOptionsGroupBox = New-Object System.Windows.Forms.GroupBox
+    $MsiOptionsGroupBox.Text = "MSI/MST Scan Options"
+    $MsiOptionsGroupBox.Location = New-Object System.Drawing.Point(780, 10)
+    $MsiOptionsGroupBox.Size = New-Object System.Drawing.Size(580, 100)
+    $MsiOptionsGroupBox.Visible = $false
+
+    $ChkScanMsi = New-Object System.Windows.Forms.CheckBox
+    $ChkScanMsi.Text = "Scan MSI files"
+    $ChkScanMsi.Location = New-Object System.Drawing.Point(15, 20)
+    $ChkScanMsi.Size = New-Object System.Drawing.Size(120, 20)
+    $ChkScanMsi.Checked = $true
+
+    $ChkScanMst = New-Object System.Windows.Forms.CheckBox
+    $ChkScanMst.Text = "Scan MST files"
+    $ChkScanMst.Location = New-Object System.Drawing.Point(15, 45)
+    $ChkScanMst.Size = New-Object System.Drawing.Size(120, 20)
+    $ChkScanMst.Checked = $true
+
+    $ChkDeepBinary = New-Object System.Windows.Forms.CheckBox
+    $ChkDeepBinary.Text = "Deep scan Binary streams"
+    $ChkDeepBinary.Location = New-Object System.Drawing.Point(150, 20)
+    $ChkDeepBinary.Size = New-Object System.Drawing.Size(180, 20)
+    $ChkDeepBinary.Checked = $false
+
+    $ChkActiveSetup = New-Object System.Windows.Forms.CheckBox
+    $ChkActiveSetup.Text = "Detect Active Setup indicators"
+    $ChkActiveSetup.Location = New-Object System.Drawing.Point(150, 45)
+    $ChkActiveSetup.Size = New-Object System.Drawing.Size(200, 20)
+    $ChkActiveSetup.Checked = $true
+
+    $ChkMsiRecurse = New-Object System.Windows.Forms.CheckBox
+    $ChkMsiRecurse.Text = "Recurse subdirectories"
+    $ChkMsiRecurse.Location = New-Object System.Drawing.Point(370, 20)
+    $ChkMsiRecurse.Size = New-Object System.Drawing.Size(160, 20)
+    $ChkMsiRecurse.Checked = $true
+
+    $LblMsiExclude = New-Object System.Windows.Forms.Label
+    $LblMsiExclude.Text = "Exclude:"
+    $LblMsiExclude.Location = New-Object System.Drawing.Point(370, 48)
+    $LblMsiExclude.Size = New-Object System.Drawing.Size(50, 18)
+
+    $TxtMsiExcludePaths = New-Object System.Windows.Forms.TextBox
+    $TxtMsiExcludePaths.Location = New-Object System.Drawing.Point(425, 46)
+    $TxtMsiExcludePaths.Size = New-Object System.Drawing.Size(140, 23)
+
+    $MsiOptionsGroupBox.Controls.Add($ChkScanMsi)
+    $MsiOptionsGroupBox.Controls.Add($ChkScanMst)
+    $MsiOptionsGroupBox.Controls.Add($ChkDeepBinary)
+    $MsiOptionsGroupBox.Controls.Add($ChkActiveSetup)
+    $MsiOptionsGroupBox.Controls.Add($ChkMsiRecurse)
+    $MsiOptionsGroupBox.Controls.Add($LblMsiExclude)
+    $MsiOptionsGroupBox.Controls.Add($TxtMsiExcludePaths)
+
+    # ========== OUTPUT FOLDER ==========
     $LblOutputFolder = New-Object System.Windows.Forms.Label
     $LblOutputFolder.Text = "Output Folder:"
-    $LblOutputFolder.Location = New-Object System.Drawing.Point(10, 140)
+    $LblOutputFolder.Location = New-Object System.Drawing.Point(10, 120)
     $LblOutputFolder.Size = New-Object System.Drawing.Size(90, 20)
 
     $TxtOutputFolder = New-Object System.Windows.Forms.TextBox
-    $TxtOutputFolder.Location = New-Object System.Drawing.Point(105, 138)
-    $TxtOutputFolder.Size = New-Object System.Drawing.Size(800, 23)
+    $TxtOutputFolder.Location = New-Object System.Drawing.Point(105, 118)
+    $TxtOutputFolder.Size = New-Object System.Drawing.Size(900, 23)
     $TxtOutputFolder.Text = $Script:DefaultOutputFolder
 
     $BtnBrowseFolder = New-Object System.Windows.Forms.Button
     $BtnBrowseFolder.Text = "Browse..."
-    $BtnBrowseFolder.Location = New-Object System.Drawing.Point(915, 136)
+    $BtnBrowseFolder.Location = New-Object System.Drawing.Point(1015, 116)
     $BtnBrowseFolder.Size = New-Object System.Drawing.Size(80, 27)
 
-    # Action Buttons
+    # ========== ACTION BUTTONS ==========
     $BtnScan = New-Object System.Windows.Forms.Button
     $BtnScan.Text = "Scan"
-    $BtnScan.Location = New-Object System.Drawing.Point(10, 175)
-    $BtnScan.Size = New-Object System.Drawing.Size(100, 30)
+    $BtnScan.Location = New-Object System.Drawing.Point(10, 155)
+    $BtnScan.Size = New-Object System.Drawing.Size(100, 32)
     $BtnScan.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
     $BtnScan.ForeColor = [System.Drawing.Color]::White
     $BtnScan.FlatStyle = "Flat"
@@ -857,41 +1806,51 @@ function Build-MainForm {
 
     $BtnCancel = New-Object System.Windows.Forms.Button
     $BtnCancel.Text = "Cancel"
-    $BtnCancel.Location = New-Object System.Drawing.Point(120, 175)
-    $BtnCancel.Size = New-Object System.Drawing.Size(80, 30)
+    $BtnCancel.Location = New-Object System.Drawing.Point(120, 155)
+    $BtnCancel.Size = New-Object System.Drawing.Size(80, 32)
     $BtnCancel.Enabled = $false
 
     $BtnGenerateReport = New-Object System.Windows.Forms.Button
     $BtnGenerateReport.Text = "Generate Report"
-    $BtnGenerateReport.Location = New-Object System.Drawing.Point(210, 175)
-    $BtnGenerateReport.Size = New-Object System.Drawing.Size(110, 30)
+    $BtnGenerateReport.Location = New-Object System.Drawing.Point(210, 155)
+    $BtnGenerateReport.Size = New-Object System.Drawing.Size(115, 32)
     $BtnGenerateReport.Enabled = $false
 
     $BtnOpenLog = New-Object System.Windows.Forms.Button
     $BtnOpenLog.Text = "Open Log"
-    $BtnOpenLog.Location = New-Object System.Drawing.Point(330, 175)
-    $BtnOpenLog.Size = New-Object System.Drawing.Size(80, 30)
+    $BtnOpenLog.Location = New-Object System.Drawing.Point(335, 155)
+    $BtnOpenLog.Size = New-Object System.Drawing.Size(80, 32)
 
     $BtnExportCSV = New-Object System.Windows.Forms.Button
     $BtnExportCSV.Text = "Export CSV"
-    $BtnExportCSV.Location = New-Object System.Drawing.Point(420, 175)
-    $BtnExportCSV.Size = New-Object System.Drawing.Size(90, 30)
+    $BtnExportCSV.Location = New-Object System.Drawing.Point(425, 155)
+    $BtnExportCSV.Size = New-Object System.Drawing.Size(90, 32)
     $BtnExportCSV.Enabled = $false
 
     # Progress Bar and Status
     $ProgressBar = New-Object System.Windows.Forms.ProgressBar
-    $ProgressBar.Location = New-Object System.Drawing.Point(530, 175)
-    $ProgressBar.Size = New-Object System.Drawing.Size(350, 25)
+    $ProgressBar.Location = New-Object System.Drawing.Point(530, 155)
+    $ProgressBar.Size = New-Object System.Drawing.Size(400, 27)
     $ProgressBar.Style = "Continuous"
 
     $LblStatus = New-Object System.Windows.Forms.Label
     $LblStatus.Text = "Ready"
-    $LblStatus.Location = New-Object System.Drawing.Point(890, 180)
-    $LblStatus.Size = New-Object System.Drawing.Size(350, 20)
+    $LblStatus.Location = New-Object System.Drawing.Point(940, 160)
+    $LblStatus.Size = New-Object System.Drawing.Size(400, 22)
     $LblStatus.ForeColor = [System.Drawing.Color]::DarkGreen
 
+    # Current mode indicator
+    $LblCurrentMode = New-Object System.Windows.Forms.Label
+    $LblCurrentMode.Text = "Mode: VBS File Scan"
+    $LblCurrentMode.Location = New-Object System.Drawing.Point(10, 195)
+    $LblCurrentMode.Size = New-Object System.Drawing.Size(600, 20)
+    $LblCurrentMode.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    $LblCurrentMode.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+
+    $TopPanel.Controls.Add($ScanModeGroupBox)
     $TopPanel.Controls.Add($InputGroupBox)
-    $TopPanel.Controls.Add($OptionsGroupBox)
+    $TopPanel.Controls.Add($VbsOptionsGroupBox)
+    $TopPanel.Controls.Add($MsiOptionsGroupBox)
     $TopPanel.Controls.Add($LblOutputFolder)
     $TopPanel.Controls.Add($TxtOutputFolder)
     $TopPanel.Controls.Add($BtnBrowseFolder)
@@ -902,90 +1861,129 @@ function Build-MainForm {
     $TopPanel.Controls.Add($BtnExportCSV)
     $TopPanel.Controls.Add($ProgressBar)
     $TopPanel.Controls.Add($LblStatus)
+    $TopPanel.Controls.Add($LblCurrentMode)
     #endregion
 
-    #region DataGridView for Results - with Phase 2 columns
-    $DataGridView = New-Object System.Windows.Forms.DataGridView
-    $DataGridView.Dock = "Fill"
-    $DataGridView.AllowUserToAddRows = $false
-    $DataGridView.AllowUserToDeleteRows = $false
-    $DataGridView.ReadOnly = $true
-    $DataGridView.SelectionMode = "FullRowSelect"
-    $DataGridView.MultiSelect = $false
-    $DataGridView.AutoSizeColumnsMode = "Fill"
-    $DataGridView.RowHeadersVisible = $false
-    $DataGridView.BackgroundColor = [System.Drawing.Color]::White
-    $DataGridView.BorderStyle = "None"
-    $DataGridView.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
-    $DataGridView.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
-    $DataGridView.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-    $DataGridView.EnableHeadersVisualStyles = $false
-    $DataGridView.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
-    $DataGridView.AllowUserToOrderColumns = $true  # Enable column reordering
+    #region TabControl for Results (VBS vs MSI)
+    $TabControl = New-Object System.Windows.Forms.TabControl
+    $TabControl.Dock = "Fill"
 
-    # Define columns - with Phase 2 additions
-    $ColFileName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $ColFileName.Name = "FileName"
-    $ColFileName.HeaderText = "File Name"
-    $ColFileName.FillWeight = 15
-    $null = $DataGridView.Columns.Add($ColFileName)
+    $TabVbsResults = New-Object System.Windows.Forms.TabPage
+    $TabVbsResults.Text = "VBS File Results"
 
-    $ColFullPath = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $ColFullPath.Name = "FullPath"
-    $ColFullPath.HeaderText = "Full Path"
-    $ColFullPath.FillWeight = 25
-    $null = $DataGridView.Columns.Add($ColFullPath)
+    $TabMsiResults = New-Object System.Windows.Forms.TabPage
+    $TabMsiResults.Text = "MSI/MST Findings"
 
-    $ColParentFolder = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $ColParentFolder.Name = "ParentFolder"
-    $ColParentFolder.HeaderText = "Parent Folder"
-    $ColParentFolder.FillWeight = 18
-    $null = $DataGridView.Columns.Add($ColParentFolder)
+    $TabControl.TabPages.Add($TabVbsResults)
+    $TabControl.TabPages.Add($TabMsiResults)
+    #endregion
 
-    # Phase 2: New columns for Archive metadata
-    $ColPackageName = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $ColPackageName.Name = "PackageName"
-    $ColPackageName.HeaderText = "Package"
-    $ColPackageName.FillWeight = 10
-    $null = $DataGridView.Columns.Add($ColPackageName)
+    #region VBS DataGridView
+    $DataGridViewVbs = New-Object System.Windows.Forms.DataGridView
+    $DataGridViewVbs.Dock = "Fill"
+    $DataGridViewVbs.AllowUserToAddRows = $false
+    $DataGridViewVbs.AllowUserToDeleteRows = $false
+    $DataGridViewVbs.ReadOnly = $true
+    $DataGridViewVbs.SelectionMode = "FullRowSelect"
+    $DataGridViewVbs.MultiSelect = $false
+    $DataGridViewVbs.AutoSizeColumnsMode = "Fill"
+    $DataGridViewVbs.RowHeadersVisible = $false
+    $DataGridViewVbs.BackgroundColor = [System.Drawing.Color]::White
+    $DataGridViewVbs.BorderStyle = "None"
+    $DataGridViewVbs.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    $DataGridViewVbs.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+    $DataGridViewVbs.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $DataGridViewVbs.EnableHeadersVisualStyles = $false
+    $DataGridViewVbs.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
+    $DataGridViewVbs.AllowUserToOrderColumns = $true
 
-    $ColVersion = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $ColVersion.Name = "Version"
-    $ColVersion.HeaderText = "Version"
-    $ColVersion.FillWeight = 8
-    $null = $DataGridView.Columns.Add($ColVersion)
+    # VBS Grid Columns
+    @(
+        @{Name="FileName"; Header="File Name"; Weight=15},
+        @{Name="FullPath"; Header="Full Path"; Weight=25},
+        @{Name="ParentFolder"; Header="Parent Folder"; Weight=18},
+        @{Name="PackageName"; Header="Package"; Weight=10},
+        @{Name="Version"; Header="Version"; Weight=8},
+        @{Name="Build"; Header="Build"; Weight=8},
+        @{Name="LastWriteTime"; Header="Last Modified"; Weight=10},
+        @{Name="SizeBytes"; Header="Size (Bytes)"; Weight=6}
+    ) | ForEach-Object {
+        $Col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $Col.Name = $_.Name
+        $Col.HeaderText = $_.Header
+        $Col.FillWeight = $_.Weight
+        if ($_.Name -eq "SizeBytes") { $Col.DefaultCellStyle.Alignment = "MiddleRight" }
+        $null = $DataGridViewVbs.Columns.Add($Col)
+    }
 
-    $ColBuild = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $ColBuild.Name = "Build"
-    $ColBuild.HeaderText = "Build"
-    $ColBuild.FillWeight = 8
-    $null = $DataGridView.Columns.Add($ColBuild)
+    # VBS Context Menu
+    $VbsContextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $VbsMenuOpenNotepad = New-Object System.Windows.Forms.ToolStripMenuItem
+    $VbsMenuOpenNotepad.Text = "Open in Notepad"
+    $VbsMenuCopyPath = New-Object System.Windows.Forms.ToolStripMenuItem
+    $VbsMenuCopyPath.Text = "Copy Full Path"
+    $VbsMenuOpenFolder = New-Object System.Windows.Forms.ToolStripMenuItem
+    $VbsMenuOpenFolder.Text = "Open Containing Folder"
+    $null = $VbsContextMenu.Items.Add($VbsMenuOpenNotepad)
+    $null = $VbsContextMenu.Items.Add($VbsMenuCopyPath)
+    $null = $VbsContextMenu.Items.Add($VbsMenuOpenFolder)
+    $DataGridViewVbs.ContextMenuStrip = $VbsContextMenu
 
-    $ColLastWriteTime = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $ColLastWriteTime.Name = "LastWriteTime"
-    $ColLastWriteTime.HeaderText = "Last Modified"
-    $ColLastWriteTime.FillWeight = 10
-    $null = $DataGridView.Columns.Add($ColLastWriteTime)
+    $TabVbsResults.Controls.Add($DataGridViewVbs)
+    #endregion
 
-    $ColSizeBytes = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
-    $ColSizeBytes.Name = "SizeBytes"
-    $ColSizeBytes.HeaderText = "Size (Bytes)"
-    $ColSizeBytes.FillWeight = 6
-    $ColSizeBytes.DefaultCellStyle.Alignment = "MiddleRight"
-    $null = $DataGridView.Columns.Add($ColSizeBytes)
+    #region MSI DataGridView (NEW)
+    $DataGridViewMsi = New-Object System.Windows.Forms.DataGridView
+    $DataGridViewMsi.Dock = "Fill"
+    $DataGridViewMsi.AllowUserToAddRows = $false
+    $DataGridViewMsi.AllowUserToDeleteRows = $false
+    $DataGridViewMsi.ReadOnly = $true
+    $DataGridViewMsi.SelectionMode = "FullRowSelect"
+    $DataGridViewMsi.MultiSelect = $false
+    $DataGridViewMsi.AutoSizeColumnsMode = "Fill"
+    $DataGridViewMsi.RowHeadersVisible = $false
+    $DataGridViewMsi.BackgroundColor = [System.Drawing.Color]::White
+    $DataGridViewMsi.BorderStyle = "None"
+    $DataGridViewMsi.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(139, 0, 0)  # Dark red for MSI
+    $DataGridViewMsi.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+    $DataGridViewMsi.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $DataGridViewMsi.EnableHeadersVisualStyles = $false
+    $DataGridViewMsi.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 245, 245)
+    $DataGridViewMsi.AllowUserToOrderColumns = $true
 
-    # Context Menu for DataGridView
-    $ContextMenu = New-Object System.Windows.Forms.ContextMenuStrip
-    $MenuOpenNotepad = New-Object System.Windows.Forms.ToolStripMenuItem
-    $MenuOpenNotepad.Text = "Open in Notepad"
-    $MenuCopyPath = New-Object System.Windows.Forms.ToolStripMenuItem
-    $MenuCopyPath.Text = "Copy Full Path"
-    $MenuOpenFolder = New-Object System.Windows.Forms.ToolStripMenuItem
-    $MenuOpenFolder.Text = "Open Containing Folder"
-    $null = $ContextMenu.Items.Add($MenuOpenNotepad)
-    $null = $ContextMenu.Items.Add($MenuCopyPath)
-    $null = $ContextMenu.Items.Add($MenuOpenFolder)
-    $DataGridView.ContextMenuStrip = $ContextMenu
+    # MSI Grid Columns
+    @(
+        @{Name="InstallerPath"; Header="Installer Path"; Weight=20},
+        @{Name="FileType"; Header="Type"; Weight=5},
+        @{Name="ProductName"; Header="Product Name"; Weight=12},
+        @{Name="ProductVersion"; Header="Version"; Weight=7},
+        @{Name="FindingCategory"; Header="Category"; Weight=12},
+        @{Name="TableOrSource"; Header="Table/Source"; Weight=8},
+        @{Name="ItemName"; Header="Item Name"; Weight=10},
+        @{Name="Evidence"; Header="Evidence"; Weight=18},
+        @{Name="Severity"; Header="Severity"; Weight=6}
+    ) | ForEach-Object {
+        $Col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $Col.Name = $_.Name
+        $Col.HeaderText = $_.Header
+        $Col.FillWeight = $_.Weight
+        $null = $DataGridViewMsi.Columns.Add($Col)
+    }
+
+    # MSI Context Menu
+    $MsiContextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $MsiMenuOpenExplorer = New-Object System.Windows.Forms.ToolStripMenuItem
+    $MsiMenuOpenExplorer.Text = "Open in Explorer"
+    $MsiMenuCopyPath = New-Object System.Windows.Forms.ToolStripMenuItem
+    $MsiMenuCopyPath.Text = "Copy Installer Path"
+    $MsiMenuCopyEvidence = New-Object System.Windows.Forms.ToolStripMenuItem
+    $MsiMenuCopyEvidence.Text = "Copy Evidence"
+    $null = $MsiContextMenu.Items.Add($MsiMenuOpenExplorer)
+    $null = $MsiContextMenu.Items.Add($MsiMenuCopyPath)
+    $null = $MsiContextMenu.Items.Add($MsiMenuCopyEvidence)
+    $DataGridViewMsi.ContextMenuStrip = $MsiContextMenu
+
+    $TabMsiResults.Controls.Add($DataGridViewMsi)
     #endregion
 
     #region WebBrowser for HTML Report
@@ -1005,7 +2003,7 @@ function Build-MainForm {
     #endregion
 
     #region Assemble Layout
-    $SplitContainer.Panel1.Controls.Add($DataGridView)
+    $SplitContainer.Panel1.Controls.Add($TabControl)
     $SplitContainer.Panel2.Controls.Add($WebBrowser)
     $SplitContainer.Panel2.Controls.Add($LblReportHeader)
 
@@ -1015,7 +2013,30 @@ function Build-MainForm {
 
     #region EVENT HANDLERS
 
-    # Radio button toggle for entry type selection
+    # Scan Mode toggle
+    $RadioVbsScan.Add_CheckedChanged({
+        if ($RadioVbsScan.Checked) {
+            $Script:CurrentScanMode = "VBSFileScan"
+            $VbsOptionsGroupBox.Visible = $true
+            $MsiOptionsGroupBox.Visible = $false
+            $LblCurrentMode.Text = "Mode: VBS File Scan - Searches for .vbs files"
+            $LblCurrentMode.ForeColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
+            $TabControl.SelectedTab = $TabVbsResults
+        }
+    })
+
+    $RadioMsiScan.Add_CheckedChanged({
+        if ($RadioMsiScan.Checked) {
+            $Script:CurrentScanMode = "MSIMSTScan"
+            $VbsOptionsGroupBox.Visible = $false
+            $MsiOptionsGroupBox.Visible = $true
+            $LblCurrentMode.Text = "Mode: MSI/MST Scan - Detects VBScript indicators in Windows Installer files"
+            $LblCurrentMode.ForeColor = [System.Drawing.Color]::FromArgb(139, 0, 0)
+            $TabControl.SelectedTab = $TabMsiResults
+        }
+    })
+
+    # Target type toggles
     $RadioDevice.Add_CheckedChanged({
         $TxtDeviceName.Enabled = $RadioDevice.Checked
         $TxtUNCPath.Enabled = $RadioUNC.Checked
@@ -1044,11 +2065,10 @@ function Build-MainForm {
         $FolderBrowser.SelectedPath = $TxtOutputFolder.Text
         if ($FolderBrowser.ShowDialog() -eq "OK") {
             $TxtOutputFolder.Text = $FolderBrowser.SelectedPath
-            $Script:LogFile = Join-Path -Path $FolderBrowser.SelectedPath -ChildPath "VBSScanner_$($Script:Timestamp).log"
         }
     })
 
-    # Open Log button
+    # Open Log
     $BtnOpenLog.Add_Click({
         if (Test-Path -Path $Script:LogFile) {
             Start-Process -FilePath "notepad.exe" -ArgumentList "`"$Script:LogFile`""
@@ -1058,23 +2078,31 @@ function Build-MainForm {
         }
     })
 
-    # Export CSV button - updated for Phase 2 columns
+    # Export CSV
     $BtnExportCSV.Add_Click({
-        if ($Script:ScanResults.Count -eq 0) {
+        $HasResults = if ($Script:CurrentScanMode -eq "VBSFileScan") { $Script:ScanResults.Count -gt 0 } else { $Script:MsiScanResults.Count -gt 0 }
+
+        if (-not $HasResults) {
             [System.Windows.Forms.MessageBox]::Show("No results to export.", "Export CSV", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
             return
         }
 
         $SaveDialog = New-Object System.Windows.Forms.SaveFileDialog
         $SaveDialog.Filter = "CSV Files (*.csv)|*.csv"
-        $SaveDialog.FileName = "VBSScanner_Results_$($Script:Timestamp).csv"
+        $Prefix = if ($Script:CurrentScanMode -eq "VBSFileScan") { "VBS" } else { "MSI" }
+        $SaveDialog.FileName = "${Prefix}Scanner_Results_$($Script:Timestamp).csv"
         $SaveDialog.InitialDirectory = $TxtOutputFolder.Text
 
         if ($SaveDialog.ShowDialog() -eq "OK") {
             try {
-                # Export with all columns including Phase 2 additions
-                $Script:ScanResults | Select-Object FileName, FullPath, ParentFolder, PackageName, Version, Build, LastWriteTime, SizeBytes | 
-                    Export-Csv -Path $SaveDialog.FileName -NoTypeInformation -Encoding UTF8
+                if ($Script:CurrentScanMode -eq "VBSFileScan") {
+                    $Script:ScanResults | Select-Object FileName, FullPath, ParentFolder, PackageName, Version, Build, LastWriteTime, SizeBytes | 
+                        Export-Csv -Path $SaveDialog.FileName -NoTypeInformation -Encoding UTF8
+                }
+                else {
+                    $Script:MsiScanResults | Select-Object InstallerPath, FileType, ProductName, ProductVersion, ProductCode, FindingCategory, TableOrSource, ItemName, Evidence, Severity | 
+                        Export-Csv -Path $SaveDialog.FileName -NoTypeInformation -Encoding UTF8
+                }
                 Write-CMTraceLog -Message "Exported results to CSV: $($SaveDialog.FileName)" -Component "Export"
                 [System.Windows.Forms.MessageBox]::Show("Results exported to: $($SaveDialog.FileName)", "Export Complete", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
             }
@@ -1085,31 +2113,26 @@ function Build-MainForm {
         }
     })
 
-    # DataGridView double-click to open in Notepad
-    $DataGridView.Add_CellDoubleClick({
+    # VBS Grid double-click
+    $DataGridViewVbs.Add_CellDoubleClick({
         param($sender, $e)
         if ($e.RowIndex -ge 0) {
-            $FilePath = $DataGridView.Rows[$e.RowIndex].Cells["FullPath"].Value
-            if ($FilePath) {
-                Open-FileInNotepad -FilePath $FilePath
-            }
+            $FilePath = $DataGridViewVbs.Rows[$e.RowIndex].Cells["FullPath"].Value
+            if ($FilePath) { Open-FileInNotepad -FilePath $FilePath }
         }
     })
 
-    # Context menu - Open in Notepad
-    $MenuOpenNotepad.Add_Click({
-        if ($DataGridView.SelectedRows.Count -gt 0) {
-            $FilePath = $DataGridView.SelectedRows[0].Cells["FullPath"].Value
-            if ($FilePath) {
-                Open-FileInNotepad -FilePath $FilePath
-            }
+    # VBS Context menu actions
+    $VbsMenuOpenNotepad.Add_Click({
+        if ($DataGridViewVbs.SelectedRows.Count -gt 0) {
+            $FilePath = $DataGridViewVbs.SelectedRows[0].Cells["FullPath"].Value
+            if ($FilePath) { Open-FileInNotepad -FilePath $FilePath }
         }
     })
 
-    # Context menu - Copy Path
-    $MenuCopyPath.Add_Click({
-        if ($DataGridView.SelectedRows.Count -gt 0) {
-            $FilePath = $DataGridView.SelectedRows[0].Cells["FullPath"].Value
+    $VbsMenuCopyPath.Add_Click({
+        if ($DataGridViewVbs.SelectedRows.Count -gt 0) {
+            $FilePath = $DataGridViewVbs.SelectedRows[0].Cells["FullPath"].Value
             if ($FilePath) {
                 [System.Windows.Forms.Clipboard]::SetText($FilePath)
                 $LblStatus.Text = "Path copied to clipboard"
@@ -1117,55 +2140,98 @@ function Build-MainForm {
         }
     })
 
-    # Context menu - Open Containing Folder
-    $MenuOpenFolder.Add_Click({
-        if ($DataGridView.SelectedRows.Count -gt 0) {
-            $FilePath = $DataGridView.SelectedRows[0].Cells["FullPath"].Value
-            if ($FilePath) {
-                $ParentFolder = Split-Path -Path $FilePath -Parent
-                if (Test-Path -Path $ParentFolder) {
-                    Start-Process -FilePath "explorer.exe" -ArgumentList "`"$ParentFolder`""
-                }
+    $VbsMenuOpenFolder.Add_Click({
+        if ($DataGridViewVbs.SelectedRows.Count -gt 0) {
+            $FilePath = $DataGridViewVbs.SelectedRows[0].Cells["FullPath"].Value
+            if ($FilePath) { Open-FileInExplorer -FilePath $FilePath }
+        }
+    })
+
+    # MSI Grid double-click
+    $DataGridViewMsi.Add_CellDoubleClick({
+        param($sender, $e)
+        if ($e.RowIndex -ge 0) {
+            $InstallerPath = $DataGridViewMsi.Rows[$e.RowIndex].Cells["InstallerPath"].Value
+            if ($InstallerPath) { Open-FileInExplorer -FilePath $InstallerPath }
+        }
+    })
+
+    # MSI Context menu actions
+    $MsiMenuOpenExplorer.Add_Click({
+        if ($DataGridViewMsi.SelectedRows.Count -gt 0) {
+            $InstallerPath = $DataGridViewMsi.SelectedRows[0].Cells["InstallerPath"].Value
+            if ($InstallerPath) { Open-FileInExplorer -FilePath $InstallerPath }
+        }
+    })
+
+    $MsiMenuCopyPath.Add_Click({
+        if ($DataGridViewMsi.SelectedRows.Count -gt 0) {
+            $InstallerPath = $DataGridViewMsi.SelectedRows[0].Cells["InstallerPath"].Value
+            if ($InstallerPath) {
+                [System.Windows.Forms.Clipboard]::SetText($InstallerPath)
+                $LblStatus.Text = "Path copied to clipboard"
             }
         }
     })
 
-    # WebBrowser Navigating event - intercept file:// links to open in Notepad
+    $MsiMenuCopyEvidence.Add_Click({
+        if ($DataGridViewMsi.SelectedRows.Count -gt 0) {
+            $Evidence = $DataGridViewMsi.SelectedRows[0].Cells["Evidence"].Value
+            if ($Evidence) {
+                [System.Windows.Forms.Clipboard]::SetText($Evidence)
+                $LblStatus.Text = "Evidence copied to clipboard"
+            }
+        }
+    })
+
+    # WebBrowser navigation intercept for VBS files
     $WebBrowser.Add_Navigating({
         param($sender, $e)
         $Url = $e.Url.ToString()
 
         if ($Url -like "file:///*" -and $Url -like "*.vbs") {
             $e.Cancel = $true
-
-            # Convert file URI to local path
             $FilePath = $Url -replace "^file:///", ""
             $FilePath = $FilePath -replace "/", "\"
             $FilePath = [System.Web.HttpUtility]::UrlDecode($FilePath)
-
             Write-CMTraceLog -Message "WebBrowser link clicked: $FilePath" -Component "WebBrowser"
             Open-FileInNotepad -FilePath $FilePath
         }
+        elseif ($Url -like "explorer:*") {
+            $e.Cancel = $true
+            $FilePath = $Url -replace "^explorer:/select/", ""
+            $FilePath = $FilePath -replace "/", "\"
+            $FilePath = [System.Web.HttpUtility]::UrlDecode($FilePath)
+            Open-FileInExplorer -FilePath $FilePath
+        }
     })
 
-    # Generate Report button - updated for Phase 2
+    # Generate Report
     $BtnGenerateReport.Add_Click({
-        if ($Script:ScanResults.Count -eq 0) {
+        $HasResults = if ($Script:CurrentScanMode -eq "VBSFileScan") { $Script:ScanResults.Count -gt 0 } else { $Script:MsiScanResults.Count -gt 0 }
+
+        if (-not $HasResults) {
             [System.Windows.Forms.MessageBox]::Show("No results to generate report from.", "Generate Report", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
             return
         }
 
         $EndTime = Get-Date
-        $Script:HtmlReportFile = Join-Path -Path $TxtOutputFolder.Text -ChildPath "VBSScanner_Report_$($Script:Timestamp).html"
+        $Prefix = if ($Script:CurrentScanMode -eq "VBSFileScan") { "VBS" } else { "MSI" }
+        $Script:HtmlReportFile = Join-Path -Path $TxtOutputFolder.Text -ChildPath "${Prefix}Scanner_Report_$($Script:Timestamp).html"
 
-        # Determine entry type and scan root
         $EntryType = $Script:CurrentEntryType
         $ScanRoot = Get-ScanRootFromInput -InputType $EntryType -DeviceName $TxtDeviceName.Text -UncPath $TxtUNCPath.Text -ArchiveRoot $TxtArchiveRoot.Text
 
         $LblStatus.Text = "Generating HTML report..."
         $MainForm.Refresh()
 
-        $Success = New-HtmlReport -Results $Script:ScanResults -ScanRoot $ScanRoot -EntryType $EntryType -StartTime $Script:StartTime -EndTime $EndTime -ErrorCount $Script:ErrorCount -OutputPath $Script:HtmlReportFile
+        $Success = $false
+        if ($Script:CurrentScanMode -eq "VBSFileScan") {
+            $Success = New-HtmlReport -Results $Script:ScanResults -ScanRoot $ScanRoot -EntryType $EntryType -StartTime $Script:StartTime -EndTime $EndTime -ErrorCount $Script:ErrorCount -OutputPath $Script:HtmlReportFile
+        }
+        else {
+            $Success = New-MsiHtmlReport -Findings $Script:MsiScanResults -ScanRoot $ScanRoot -StartTime $Script:StartTime -EndTime $EndTime -ErrorCount $Script:MsiErrorCount -FilesScanned $Script:MsiFilesScanned -FilesWithFindings $Script:MsiFilesWithFindings -OutputPath $Script:HtmlReportFile
+        }
 
         if ($Success) {
             $WebBrowser.Navigate($Script:HtmlReportFile)
@@ -1186,15 +2252,13 @@ function Build-MainForm {
         Write-CMTraceLog -Message "Scan cancellation requested by user" -Severity 2 -Component "Scan"
     })
 
-    # Scan button click - updated for Phase 2
+    # Scan button
     $BtnScan.Add_Click({
-        # Determine entry type
         $EntryType = "DeviceName"
         if ($RadioUNC.Checked) { $EntryType = "UNC" }
         if ($RadioArchive.Checked) { $EntryType = "ArchiveRoot" }
         $Script:CurrentEntryType = $EntryType
 
-        # Get scan root based on entry type
         $ScanRoot = Get-ScanRootFromInput -InputType $EntryType -DeviceName $TxtDeviceName.Text -UncPath $TxtUNCPath.Text -ArchiveRoot $TxtArchiveRoot.Text
 
         if ([string]::IsNullOrWhiteSpace($ScanRoot)) {
@@ -1207,7 +2271,6 @@ function Build-MainForm {
             return
         }
 
-        # Validate output folder
         if (-not (Test-Path -Path $TxtOutputFolder.Text -PathType Container)) {
             try {
                 New-Item -Path $TxtOutputFolder.Text -ItemType Directory -Force | Out-Null
@@ -1218,50 +2281,71 @@ function Build-MainForm {
             }
         }
 
-        # Update log file path
         $Script:Timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
         $Script:LogFile = Join-Path -Path $TxtOutputFolder.Text -ChildPath "VBSScanner_$($Script:Timestamp).log"
-
-        # Parse exclude paths
-        $ExcludePaths = @()
-        if (-not [string]::IsNullOrWhiteSpace($TxtExcludePaths.Text)) {
-            $ExcludePaths = $TxtExcludePaths.Text -split ";" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-        }
-
-        Write-CMTraceLog -Message "Starting scan - EntryType: $EntryType | Root: $ScanRoot | Recurse: $($ChkRecurse.Checked) | Excludes: $($ExcludePaths -join ', ')" -Component "Scan"
-
-        # Reset state
         $Script:StartTime = Get-Date
         $Script:ScanCancelled = $false
         $Script:IsScanning = $true
         $WebBrowser.Navigate("about:blank")
 
-        # Update UI
         $BtnScan.Enabled = $false
         $BtnCancel.Enabled = $true
         $BtnGenerateReport.Enabled = $false
         $BtnExportCSV.Enabled = $false
         $ProgressBar.Value = 0
-        $LblStatus.Text = "Initializing scan ($EntryType)..."
-        $LblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
         $MainForm.Refresh()
 
-        # Run scan with entry type for metadata extraction
-        $Success = Start-VbsScan -ScanRoot $ScanRoot -EntryType $EntryType -Recurse $ChkRecurse.Checked -ExcludePaths $ExcludePaths -ProgressBar $ProgressBar -StatusLabel $LblStatus -DataGrid $DataGridView -ParentForm $MainForm
+        $Success = $false
 
-        # Update UI after scan
+        if ($Script:CurrentScanMode -eq "VBSFileScan") {
+            $ExcludePaths = @()
+            if (-not [string]::IsNullOrWhiteSpace($TxtExcludePaths.Text)) {
+                $ExcludePaths = $TxtExcludePaths.Text -split ";" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            }
+
+            $LblStatus.Text = "Scanning for VBS files..."
+            $LblStatus.ForeColor = [System.Drawing.Color]::DarkBlue
+
+            Write-CMTraceLog -Message "Starting VBS scan - EntryType: $EntryType | Root: $ScanRoot | Recurse: $($ChkRecurse.Checked)" -Component "Scan"
+
+            $TabControl.SelectedTab = $TabVbsResults
+            $Success = Start-VbsScan -ScanRoot $ScanRoot -EntryType $EntryType -Recurse $ChkRecurse.Checked -ExcludePaths $ExcludePaths -ProgressBar $ProgressBar -StatusLabel $LblStatus -DataGrid $DataGridViewVbs -ParentForm $MainForm
+
+            if ($Success -and -not $Script:ScanCancelled) {
+                $Duration = (Get-Date) - $Script:StartTime
+                $LblStatus.Text = "VBS Scan Complete: $($Script:ScanResults.Count) files | $($Script:ErrorCount) errors | $($Duration.ToString('hh\:mm\:ss'))"
+                $LblStatus.ForeColor = [System.Drawing.Color]::DarkGreen
+                $BtnGenerateReport.Enabled = $Script:ScanResults.Count -gt 0
+                $BtnExportCSV.Enabled = $Script:ScanResults.Count -gt 0
+            }
+        }
+        else {
+            # MSI/MST Scan
+            $MsiExcludePaths = @()
+            if (-not [string]::IsNullOrWhiteSpace($TxtMsiExcludePaths.Text)) {
+                $MsiExcludePaths = $TxtMsiExcludePaths.Text -split ";" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            }
+
+            $LblStatus.Text = "Scanning MSI/MST files for VBScript indicators..."
+            $LblStatus.ForeColor = [System.Drawing.Color]::FromArgb(139, 0, 0)
+
+            Write-CMTraceLog -Message "Starting MSI/MST scan - Root: $ScanRoot | ScanMsi: $($ChkScanMsi.Checked) | ScanMst: $($ChkScanMst.Checked) | DeepBinary: $($ChkDeepBinary.Checked)" -Component "MSIScan"
+
+            $TabControl.SelectedTab = $TabMsiResults
+            $Success = Start-MsiMstScan -ScanRoot $ScanRoot -Recurse $ChkMsiRecurse.Checked -ExcludePaths $MsiExcludePaths -ScanMsi $ChkScanMsi.Checked -ScanMst $ChkScanMst.Checked -DeepScanBinary $ChkDeepBinary.Checked -DetectActiveSetup $ChkActiveSetup.Checked -ProgressBar $ProgressBar -StatusLabel $LblStatus -DataGrid $DataGridViewMsi -ParentForm $MainForm
+
+            if ($Success -and -not $Script:ScanCancelled) {
+                $Duration = (Get-Date) - $Script:StartTime
+                $LblStatus.Text = "MSI Scan Complete: $($Script:MsiFilesScanned) files | $($Script:MsiScanResults.Count) findings | $($Script:MsiErrorCount) errors | $($Duration.ToString('hh\:mm\:ss'))"
+                $LblStatus.ForeColor = [System.Drawing.Color]::DarkGreen
+                $BtnGenerateReport.Enabled = $Script:MsiScanResults.Count -gt 0
+                $BtnExportCSV.Enabled = $Script:MsiScanResults.Count -gt 0
+            }
+        }
+
         $Script:IsScanning = $false
         $BtnScan.Enabled = $true
         $BtnCancel.Enabled = $false
-        $BtnGenerateReport.Enabled = $Script:ScanResults.Count -gt 0
-        $BtnExportCSV.Enabled = $Script:ScanResults.Count -gt 0
-
-        if ($Success -and -not $Script:ScanCancelled) {
-            $Duration = (Get-Date) - $Script:StartTime
-            $LblStatus.Text = "Complete: $($Script:ScanResults.Count) files | $($Script:ErrorCount) errors | $($Duration.ToString('hh\:mm\:ss'))"
-            $LblStatus.ForeColor = [System.Drawing.Color]::DarkGreen
-            Write-CMTraceLog -Message "Scan completed ($EntryType). Results: $($Script:ScanResults.Count) files, $($Script:ErrorCount) errors" -Component "Scan"
-        }
     })
 
     # Form closing
@@ -1281,7 +2365,6 @@ function Build-MainForm {
 
     #endregion
 
-    # Show the form
     $MainForm.Add_Shown({ $MainForm.Activate() })
     [void]$MainForm.ShowDialog()
 }
