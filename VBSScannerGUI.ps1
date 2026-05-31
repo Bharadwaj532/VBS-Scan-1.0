@@ -326,7 +326,7 @@ function Get-MsiProductInfo {
     }
 
     try {
-        $Query = "SELECT Property, Value FROM Property WHERE Property IN ('ProductName', 'ProductVersion', 'ProductCode', 'Manufacturer')"
+        $Query = "SELECT Property, Value FROM Property"  # MSI SQL does not support IN; filter in PowerShell
         $View = $Database.OpenView($Query)
         $View.Execute()
 
@@ -376,7 +376,6 @@ function Find-VBScriptCustomActions {
     $ScriptIndicators = @("cscript", "wscript", ".vbs", "vbscript", "script.exe")
 
     try {
-        Write-CMTraceLog -Message "Querying CustomAction table in $MsiPath" -Component "MSIScan"
         $Query = "SELECT Action, Type, Source, Target FROM CustomAction"
         $View = $Database.OpenView($Query)
         $View.Execute()
@@ -410,7 +409,7 @@ function Find-VBScriptCustomActions {
             if ($Target) {
                 $TargetLower = $Target.ToLower()
                 foreach ($Indicator in $ScriptIndicators) {
-                    if ($TargetLower -contains $Indicator) {
+                    if ($TargetLower -like "*$Indicator*") {
                         $Evidence = if ($Target.Length -gt 100) { $Target.Substring(0, 100) + "..." } else { $Target }
                         $Finding = New-MsiFinding -InstallerPath $MsiPath `
                             -FileType "MSI" `
@@ -458,8 +457,8 @@ function Find-ActiveSetupIndicators {
     $ScriptIndicators = @("cscript", "wscript", ".vbs", "script")
 
     try {
-        Write-CMTraceLog -Message "Querying Registry table for Active Setup in $MsiPath" -Component "MSIScan"
-        $Query = "SELECT Registry, Root, Key, Name, Value FROM Registry"
+        # WHERE clause pre-filters at DB level - avoids transferring all registry rows over UNC
+        $Query = "SELECT Registry, Root, Key, Name, Value FROM Registry WHERE Key LIKE '%Active Setup%'"
         $View = $Database.OpenView($Query)
         $View.Execute()
 
@@ -479,7 +478,7 @@ function Find-ActiveSetupIndicators {
                     $FoundIndicator = $false
 
                     foreach ($Indicator in $ScriptIndicators) {
-                        if ($ValueCheck -contains $Indicator) {
+                        if ($ValueCheck -like "*$Indicator*") {
                             $FoundIndicator = $true
                             $Evidence = "Key=$Key, Name=$Name, Value=$Value"
                             if ($Evidence.Length -gt 150) { $Evidence = $Evidence.Substring(0, 150) + "..." }
@@ -650,26 +649,22 @@ function Scan-MsiFile {
         [Parameter(Mandatory = $true)]
         [string]$MsiPath,
         [bool]$DeepScanBinary = $false,
-        [bool]$DetectActiveSetup = $true
+        [bool]$DetectActiveSetup = $true,
+        $SharedInstaller = $null  # Reuse caller-owned COM object (avoids COM re-init per file)
     )
 
     $Findings = [System.Collections.ArrayList]::new()
 
-    Write-CMTraceLog -Message "Opening MSI for scanning: $MsiPath" -Component "MSIScan"
-
-    $Installer = $null
+    $OwnInstaller = ($null -eq $SharedInstaller)
+    $Installer = if ($OwnInstaller) { New-Object -ComObject WindowsInstaller.Installer } else { $SharedInstaller }
     $Database = $null
 
     try {
-        # Create Windows Installer COM object
-        $Installer = New-Object -ComObject WindowsInstaller.Installer
-
         # Open database read-only (mode 0)
         $Database = $Installer.OpenDatabase($MsiPath, 0)
 
         # Get product information
         $ProductInfo = Get-MsiProductInfo -Database $Database -MsiPath $MsiPath
-        Write-CMTraceLog -Message "MSI Product: $($ProductInfo.ProductName) v$($ProductInfo.ProductVersion)" -Component "MSIScan"
 
         # Find VBScript custom actions
         $CAFindings = Find-VBScriptCustomActions -Database $Database -MsiPath $MsiPath -ProductInfo $ProductInfo
@@ -692,15 +687,16 @@ function Scan-MsiFile {
         $Script:MsiErrorCount++
     }
     finally {
-        # Release COM objects
+        # Always release the per-file Database COM object
         if ($null -ne $Database) {
             [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Database) | Out-Null
         }
-        if ($null -ne $Installer) {
+        # Only release Installer and run GC when we own it (not shared from caller)
+        if ($OwnInstaller -and $null -ne $Installer) {
             [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Installer) | Out-Null
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
         }
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
     }
 
     return $Findings
@@ -724,44 +720,41 @@ function Scan-MstFile {
     Write-CMTraceLog -Message "Scanning MST file: $MstPath" -Component "MSIScan"
 
     try {
-        $Bytes = [System.IO.File]::ReadAllBytes($MstPath)
-        if ($Bytes.Length -lt 10MB) {  # Only scan files under 10MB
-            # Try to extract readable strings
-            $Content = ""
-            try {
-                $Content = [System.Text.Encoding]::Unicode.GetString($Bytes)
-            }
-            catch {
-                try {
-                    $Content = [System.Text.Encoding]::ASCII.GetString($Bytes)
-                }
-                catch {
-                    $Content = ""
-                }
-            }
-
-            if ($Content) {
-                foreach ($Indicator in $Indicators) {
-                    if ($Content -like "*$Indicator*") {
-                        $Finding = New-MsiFinding -InstallerPath $MstPath `
-                            -FileType "MST" `
-                            -ProductName "(Transform)" `
-                            -ProductVersion "" `
-                            -Manufacturer "" `
-                            -ProductCode "" `
-                            -FindingCategory "TransformStringIndicator" `
-                            -TableOrSource "FileContent" `
-                            -ItemName "String Match" `
-                            -Evidence "Contains string: '$Indicator'" `
-                            -Severity "Info"
-                        $null = $Findings.Add($Finding)
-                        Write-CMTraceLog -Message "Found indicator in MST: $Indicator" -Component "MSIScan"
-                    }
-                }
-            }
+        # Pre-check size via FileInfo - avoids pulling large files over UNC unnecessarily
+        $FileSize = ([System.IO.FileInfo]::new($MstPath)).Length
+        if ($FileSize -ge 10MB) {
+            Write-CMTraceLog -Message "MST file too large ($([Math]::Round($FileSize/1MB,1)) MB): $MstPath" -Severity 2 -Component "MSIScan"
+            return $Findings
         }
-        else {
-            Write-CMTraceLog -Message "MST file too large for string scanning: $MstPath" -Severity 2 -Component "MSIScan"
+
+        $Bytes = [System.IO.File]::ReadAllBytes($MstPath)
+        $Content = ""
+        try {
+            $Content = [System.Text.Encoding]::Unicode.GetString($Bytes)
+        }
+        catch {
+            try   { $Content = [System.Text.Encoding]::ASCII.GetString($Bytes) }
+            catch { $Content = "" }
+        }
+
+        if ($Content) {
+            foreach ($Indicator in $Indicators) {
+                if ($Content -like "*$Indicator*") {
+                    $Finding = New-MsiFinding -InstallerPath $MstPath `
+                        -FileType "MST" `
+                        -ProductName "(Transform)" `
+                        -ProductVersion "" `
+                        -Manufacturer "" `
+                        -ProductCode "" `
+                        -FindingCategory "TransformStringIndicator" `
+                        -TableOrSource "FileContent" `
+                        -ItemName "String Match" `
+                        -Evidence "Contains string: '$Indicator'" `
+                        -Severity "Info"
+                    $null = $Findings.Add($Finding)
+                    Write-CMTraceLog -Message "Found indicator in MST: $Indicator" -Component "MSIScan"
+                }
+            }
         }
     }
     catch {
@@ -822,16 +815,23 @@ function Start-MsiMstScan {
     $ProgressBar.Style = "Marquee"
     $ProgressBar.MarqueeAnimationSpeed = 30
 
-    $DirsToProcess = [System.Collections.Generic.Queue[string]]::new()
-    $DirsToProcess.Enqueue($ScanRoot)
-    $DirCount = 0
-    $FileCount = 0
     $UITimer   = [System.Diagnostics.Stopwatch]::StartNew()
     $ScanTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    $StatusLabel.ForeColor = [System.Drawing.Color]::DarkGreen
+
+    # ============================================================
+    # PHASE 1 — Enumerate all matching files (fast .NET IO, no scanning yet)
+    # ============================================================
+    $StatusLabel.Text = "Enumerating MSI/MST files..."
+    [System.Windows.Forms.Application]::DoEvents()
+
+    $AllFiles      = [System.Collections.Generic.List[string]]::new()
+    $DirsToProcess = [System.Collections.Generic.Queue[string]]::new()
+    $DirsToProcess.Enqueue($ScanRoot)
 
     while ($DirsToProcess.Count -gt 0) {
         if ($Script:ScanCancelled) {
-            Write-CMTraceLog -Message "MSI/MST scan cancelled by user" -Severity 2 -Component "MSIScan"
+            Write-CMTraceLog -Message "Scan cancelled during enumeration" -Severity 2 -Component "MSIScan"
             $StatusLabel.Text = "Scan cancelled"
             $StatusLabel.ForeColor = [System.Drawing.Color]::Orange
             $ProgressBar.Style = "Continuous"
@@ -839,51 +839,26 @@ function Start-MsiMstScan {
         }
 
         $CurrentPath = $DirsToProcess.Dequeue()
-        $DirCount++
+        if (Test-PathExcluded -Path $CurrentPath -ExcludePaths $ExcludePaths) { continue }
 
-        if (Test-PathExcluded -Path $CurrentPath -ExcludePaths $ExcludePaths) {
-            continue
-        }
-
-        # Update UI periodically (Stopwatch avoids Get-Date COM overhead in hot loop)
         if ($UITimer.ElapsedMilliseconds -ge 400) {
             $ShortPath = if ($CurrentPath.Length -gt 50) { "..." + $CurrentPath.Substring($CurrentPath.Length - 47) } else { $CurrentPath }
-            $StatusLabel.Text = "MSI: $($Script:MsiFilesScanned) | Findings: $($Script:MsiScanResults.Count) | $ShortPath"
+            $StatusLabel.Text = "Enumerating: $($AllFiles.Count) files found | $ShortPath"
             [System.Windows.Forms.Application]::DoEvents()
             $UITimer.Restart()
         }
 
         try {
-            $Items = Get-ChildItem -LiteralPath $CurrentPath -Force -ErrorAction Stop
-
-            foreach ($Item in $Items) {
-                if ($Script:ScanCancelled) { break }
-
-                if ($Item.PSIsContainer) {
-                    if ($Recurse -and -not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-                        $DirsToProcess.Enqueue($Item.FullName)
-                    }
-                }
-                else {
-                    $ExtLower = $Item.Extension.ToLower()
-                    if ($Extensions -contains $ExtLower) {
-                        $FileCount++
-                        $Script:MsiFilesScanned++
-
-                        $Findings = @()
-                        if ($ExtLower -eq ".msi") {
-                            $Findings = Scan-MsiFile -MsiPath $Item.FullName -DeepScanBinary $DeepScanBinary -DetectActiveSetup $DetectActiveSetup
-                        }
-                        elseif ($ExtLower -eq ".mst") {
-                            $Findings = Scan-MstFile -MstPath $Item.FullName
-                        }
-
-                        if ($Findings.Count -gt 0) {
-                            $Script:MsiFilesWithFindings++
-                            foreach ($Finding in $Findings) {
-                                $null = $Script:MsiScanResults.Add($Finding)
-                            }
-                        }
+            foreach ($FilePath in [System.IO.Directory]::EnumerateFiles($CurrentPath)) {
+                $ExtLower = [System.IO.Path]::GetExtension($FilePath).ToLower()
+                if ($Extensions -contains $ExtLower) { $AllFiles.Add($FilePath) }
+            }
+            if ($Recurse) {
+                foreach ($SubDir in [System.IO.Directory]::EnumerateDirectories($CurrentPath)) {
+                    $DirAttrs = [System.IO.File]::GetAttributes($SubDir)
+                    if ($DirAttrs -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+                    if (-not (Test-PathExcluded -Path $SubDir -ExcludePaths $ExcludePaths)) {
+                        $DirsToProcess.Enqueue($SubDir)
                     }
                 }
             }
@@ -894,9 +869,135 @@ function Start-MsiMstScan {
         }
         catch {
             $Script:MsiErrorCount++
-            Write-CMTraceLog -Message "Error scanning $CurrentPath - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
+            Write-CMTraceLog -Message "Enumeration error at $CurrentPath - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
         }
     }
+
+    $TotalFiles = $AllFiles.Count
+    Write-CMTraceLog -Message "Enumeration complete: $TotalFiles files to scan" -Component "MSIScan"
+
+    if ($TotalFiles -eq 0) {
+        $ScanTimer.Stop()
+        $ProgressBar.Style = "Continuous"
+        $ProgressBar.Value = 100
+        $StatusLabel.Text = "No MSI/MST files found in scan path"
+        $StatusLabel.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+        return $true
+    }
+
+    # ============================================================
+    # PHASE 2 — Parallel scan via RunspacePool (STA required for COM)
+    # ============================================================
+    $MaxThreads = [Math]::Max(2, [Math]::Min(8, [Environment]::ProcessorCount))
+    $StatusLabel.Text = "Starting parallel scan ($MaxThreads threads) for $TotalFiles files..."
+    [System.Windows.Forms.Application]::DoEvents()
+    Write-CMTraceLog -Message "Parallel scan: $MaxThreads threads, $TotalFiles files" -Component "MSIScan"
+
+    # Inject scanning functions into each worker runspace
+    $InitState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    foreach ($FuncName in @('New-MsiFinding','Get-MsiProductInfo','Find-VBScriptCustomActions',
+                             'Find-ActiveSetupIndicators','Find-BinaryScriptContent','Scan-MsiFile','Scan-MstFile')) {
+        $FuncDef = (Get-Item "function:\$FuncName").Definition
+        $InitState.Commands.Add(
+            [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($FuncName, $FuncDef)
+        )
+    }
+    # No-op Write-CMTraceLog in workers (avoids log file contention; main thread logs summary)
+    $InitState.Commands.Add(
+        [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+            'Write-CMTraceLog',
+            'param([string]$Message,[int]$Severity=1,[string]$Component="MSIScan")'
+        )
+    )
+
+    $Pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(
+        1, $MaxThreads, $InitState, $Host)
+    $Pool.ApartmentState = [System.Threading.ApartmentState]::STA
+    $Pool.Open()
+
+    # Worker script: each runspace scans exactly one file and returns its findings
+    $WorkerScript = {
+        param([string]$FilePath, [bool]$DeepScanBinary, [bool]$DetectActiveSetup)
+        try {
+            $Ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
+            if ($Ext -eq '.msi') {
+                return Scan-MsiFile -MsiPath $FilePath -DeepScanBinary $DeepScanBinary -DetectActiveSetup $DetectActiveSetup
+            }
+            elseif ($Ext -eq '.mst') { return Scan-MstFile -MstPath $FilePath }
+        }
+        catch { Write-Error "[$FilePath] $($_.Exception.Message)" }
+        return @()
+    }
+
+    # Throttled submission: keep pool fed (MaxThreads*3 queue) without allocating all jobs at once
+    $ActiveJobs = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $FileIdx    = 0
+    $Completed  = 0
+    $MaxQueue   = $MaxThreads * 3
+    $UITimer.Restart()
+
+    while ($FileIdx -lt $TotalFiles -or $ActiveJobs.Count -gt 0) {
+        if ($Script:ScanCancelled) {
+            foreach ($J in $ActiveJobs) { try { $J.PS.Stop() } catch {}; $J.PS.Dispose() }
+            $ActiveJobs.Clear()
+            $Pool.Close(); $Pool.Dispose()
+            Write-CMTraceLog -Message "Parallel scan cancelled at $Completed/$TotalFiles files" -Severity 2 -Component "MSIScan"
+            $StatusLabel.Text = "Scan cancelled"
+            $StatusLabel.ForeColor = [System.Drawing.Color]::Orange
+            $ProgressBar.Style = "Continuous"
+            return $false
+        }
+
+        # Feed pool: submit new jobs up to queue limit
+        while ($ActiveJobs.Count -lt $MaxQueue -and $FileIdx -lt $TotalFiles) {
+            $FP = $AllFiles[$FileIdx++]
+            $PS = [PowerShell]::Create()
+            $PS.RunspacePool = $Pool
+            $null = $PS.AddScript($WorkerScript).AddParameter('FilePath', $FP).AddParameter('DeepScanBinary', $DeepScanBinary).AddParameter('DetectActiveSetup', $DetectActiveSetup)
+            $ActiveJobs.Add([PSCustomObject]@{ PS = $PS; Handle = $PS.BeginInvoke(); Path = $FP })
+        }
+
+        # Harvest completed jobs
+        $Done = @($ActiveJobs | Where-Object { $_.Handle.IsCompleted })
+        foreach ($J in $Done) {
+            try {
+                $Findings = $J.PS.EndInvoke($J.Handle)
+                $Script:MsiFilesScanned++
+                if ($J.PS.HadErrors) { $Script:MsiErrorCount++ }
+                if ($Findings -and $Findings.Count -gt 0) {
+                    $Script:MsiFilesWithFindings++
+                    foreach ($F in $Findings) { $null = $Script:MsiScanResults.Add($F) }
+                }
+            }
+            catch {
+                $Script:MsiErrorCount++
+                Write-CMTraceLog -Message "Worker error: $($J.Path) - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
+            }
+            finally { $J.PS.Dispose() }
+            $null = $ActiveJobs.Remove($J)
+            $Completed++
+        }
+
+        # Update progress every 400 ms or whenever jobs complete
+        if ($UITimer.ElapsedMilliseconds -ge 400 -or $Done.Count -gt 0) {
+            $Pct = if ($TotalFiles -gt 0) { [Math]::Min(99, [int]($Completed * 100 / $TotalFiles)) } else { 99 }
+            $ProgressBar.Style = "Continuous"
+            $ProgressBar.Value = $Pct
+            $StatusLabel.Text = "Scanning ($MaxThreads threads): $Completed / $TotalFiles | Findings: $($Script:MsiScanResults.Count)"
+            [System.Windows.Forms.Application]::DoEvents()
+            $UITimer.Restart()
+        }
+
+        # Yield CPU briefly when pool is saturated (avoids 100% spin-wait)
+        if ($Done.Count -eq 0 -and $ActiveJobs.Count -ge $MaxQueue) {
+            [System.Threading.Thread]::Sleep(15)
+        }
+    }
+
+    $Pool.Close()
+    $Pool.Dispose()
+    [System.GC]::Collect()
+    [System.GC]::WaitForPendingFinalizers()
 
     # Batch-populate DataGrid after scan (avoids per-row repaint during traversal)
     $StatusLabel.Text = "Populating results grid ($($Script:MsiScanResults.Count) findings)..."
@@ -905,11 +1006,6 @@ function Start-MsiMstScan {
     try {
         foreach ($Finding in $Script:MsiScanResults) {
             if ([string]::IsNullOrWhiteSpace($Finding.InstallerPath)) { continue }
-            $SeverityColor = switch ($Finding.Severity) {
-                "High"    { [System.Drawing.Color]::Red }
-                "Warning" { [System.Drawing.Color]::DarkOrange }
-                default   { [System.Drawing.Color]::Black }
-            }
             $RowIndex = $DataGrid.Rows.Add(
                 $Finding.InstallerPath,
                 $Finding.FileType,
@@ -919,10 +1015,13 @@ function Start-MsiMstScan {
                 $Finding.FindingCategory,
                 $Finding.TableOrSource,
                 $Finding.ItemName,
-                $Finding.Evidence,
-                $Finding.Severity
+                $Finding.Evidence
             )
-            $DataGrid.Rows[$RowIndex].Cells["Severity"].Style.ForeColor = $SeverityColor
+            if ($Finding.Severity -eq "High") {
+                $DataGrid.Rows[$RowIndex].DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 218, 180)
+            } elseif ($Finding.Severity -eq "Warning") {
+                $DataGrid.Rows[$RowIndex].DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 245, 200)
+            }
         }
     }
     finally {
@@ -933,7 +1032,7 @@ function Start-MsiMstScan {
     $ProgressBar.Style = "Continuous"
     $ProgressBar.Value = 100
 
-    Write-CMTraceLog -Message "MSI/MST scan complete. Scanned: $($Script:MsiFilesScanned) files, Findings: $($Script:MsiScanResults.Count), Errors: $($Script:MsiErrorCount) | Elapsed: $([Math]::Round($ScanTimer.Elapsed.TotalSeconds,2))s" -Component "MSIScan"
+    Write-CMTraceLog -Message "Parallel scan complete. Scanned: $($Script:MsiFilesScanned) files, Findings: $($Script:MsiScanResults.Count), Errors: $($Script:MsiErrorCount) | Elapsed: $([Math]::Round($ScanTimer.Elapsed.TotalSeconds,2))s | Threads: $MaxThreads" -Component "MSIScan"
     return $true
 }
 #endregion
@@ -990,10 +1089,6 @@ function New-HtmlReport {
         $RowClass = if ($RowNumber % 2 -eq 0) { "even" } else { "odd" }
         $SafeFileName = [System.Web.HttpUtility]::HtmlEncode($File.FileName)
         $SafeFullPath = [System.Web.HttpUtility]::HtmlEncode($File.FullPath)
-        $SafeParentFolder = [System.Web.HttpUtility]::HtmlEncode($File.ParentFolder)
-        $SafePackageName = [System.Web.HttpUtility]::HtmlEncode($File.PackageName)
-        $SafeVersion = [System.Web.HttpUtility]::HtmlEncode($File.Version)
-        $SafeBuild = [System.Web.HttpUtility]::HtmlEncode($File.Build)
         $FormattedDate = $File.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
         $FormattedSize = "{0:N0}" -f $File.SizeBytes
 
@@ -1005,10 +1100,6 @@ function New-HtmlReport {
             <td class="row-num">$RowNumber</td>
             <td>$SafeFileName</td>
             <td class="path-cell"><a href="$FileUri" title="Click to open in Notepad">$SafeFullPath</a></td>
-            <td>$SafeParentFolder</td>
-            <td>$SafePackageName</td>
-            <td>$SafeVersion</td>
-            <td>$SafeBuild</td>
             <td class="date-cell">$FormattedDate</td>
             <td class="size-cell">$FormattedSize</td>
         </tr>
@@ -1174,10 +1265,6 @@ function New-HtmlReport {
                         <th>#</th>
                         <th>File Name</th>
                         <th>Full Path</th>
-                        <th>Parent Folder</th>
-                        <th>Package</th>
-                        <th>Version</th>
-                        <th>Build</th>
                         <th>Last Modified</th>
                         <th>Size (Bytes)</th>
                     </tr>
@@ -1383,7 +1470,7 @@ function New-MsiHtmlReport {
         .path-cell a { color: var(--primary); text-decoration: none; }
         .path-cell a:hover { text-decoration: underline; cursor: pointer; }
         .no-results { text-align: center; padding: 30px; color: #605e5c; font-style: italic; }
-        .severity-high { color: #d83b01; font-weight: bold; }
+        .severity-high { color: #e67700; font-weight: bold; }
         .severity-warning { color: #c87000; font-weight: bold; }
         .severity-info { color: #107c10; }
         .msi-badge { background: #8b0000; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-left: 8px; }
@@ -1654,10 +1741,6 @@ function Start-VbsScan {
             $null = $DataGrid.Rows.Add(
                 $FileInfo.FileName,
                 $FileInfo.FullPath,
-                $FileInfo.ParentFolder,
-                $FileInfo.PackageName,
-                $FileInfo.Version,
-                $FileInfo.Build,
                 $FileInfo.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"),
                 $FileInfo.SizeBytes
             )
@@ -2038,14 +2121,10 @@ function Build-MainForm {
 
     # VBS Grid Columns
     @(
-        @{Name="FileName"; Header="File Name"; Weight=15},
-        @{Name="FullPath"; Header="Full Path"; Weight=25},
-        @{Name="ParentFolder"; Header="Parent Folder"; Weight=18},
-        @{Name="PackageName"; Header="Package"; Weight=10},
-        @{Name="Version"; Header="Version"; Weight=8},
-        @{Name="Build"; Header="Build"; Weight=8},
-        @{Name="LastWriteTime"; Header="Last Modified"; Weight=10},
-        @{Name="SizeBytes"; Header="Size (Bytes)"; Weight=6}
+        @{Name="FileName"; Header="File Name"; Weight=20},
+        @{Name="FullPath"; Header="Full Path"; Weight=55},
+        @{Name="LastWriteTime"; Header="Last Modified"; Weight=15},
+        @{Name="SizeBytes"; Header="Size (Bytes)"; Weight=10}
     ) | ForEach-Object {
         $Col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $Col.Name = $_.Name
@@ -2093,16 +2172,15 @@ function Build-MainForm {
 
     # MSI Grid Columns
     @(
-        @{Name="InstallerPath"; Header="Installer Path"; Weight=18},
+        @{Name="InstallerPath"; Header="Installer Path"; Weight=20},
         @{Name="FileType"; Header="Type"; Weight=5},
-        @{Name="ProductName"; Header="Product Name"; Weight=11},
-        @{Name="ProductVersion"; Header="Version"; Weight=6},
-        @{Name="Manufacturer"; Header="Vendor"; Weight=9},
+        @{Name="ProductName"; Header="Product Name"; Weight=13},
+        @{Name="ProductVersion"; Header="Version"; Weight=7},
+        @{Name="Manufacturer"; Header="Vendor"; Weight=10},
         @{Name="FindingCategory"; Header="Category"; Weight=11},
         @{Name="TableOrSource"; Header="Table/Source"; Weight=8},
         @{Name="ItemName"; Header="Item Name"; Weight=10},
-        @{Name="Evidence"; Header="Evidence"; Weight=18},
-        @{Name="Severity"; Header="Severity"; Weight=6}
+        @{Name="Evidence"; Header="Evidence"; Weight=16}
     ) | ForEach-Object {
         $Col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $Col.Name = $_.Name
