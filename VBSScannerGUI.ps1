@@ -325,28 +325,27 @@ function Get-MsiProductInfo {
         ProductCode    = ""
     }
 
-    try {
-        $Query = "SELECT Property, Value FROM Property"  # MSI SQL does not support IN; filter in PowerShell
-        $View = $Database.OpenView($Query)
-        $View.Execute()
-
-        $Record = $View.Fetch()
-        while ($null -ne $Record) {
-            $PropName = $Record.StringData(1)
-            $PropValue = $Record.StringData(2)
-
-            switch ($PropName) {
-                "ProductName"    { $ProductInfo.ProductName = $PropValue }
-                "ProductVersion" { $ProductInfo.ProductVersion = $PropValue }
-                "Manufacturer"   { $ProductInfo.Manufacturer = $PropValue }
-                "ProductCode"    { $ProductInfo.ProductCode = $PropValue }
-            }
+    # Query each property individually — MSI SQL does not support IN, and full-table
+    # iteration leaves unreleased COM Record objects that corrupt STA thread state.
+    foreach ($Key in @('ProductName', 'ProductVersion', 'Manufacturer', 'ProductCode')) {
+        $View = $null
+        try {
+            $View = $Database.OpenView("SELECT Value FROM Property WHERE Property = '$Key'")
+            $View.Execute()
             $Record = $View.Fetch()
+            if ($null -ne $Record) {
+                $ProductInfo[$Key] = $Record.StringData(1)
+                [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Record) | Out-Null
+            }
         }
-        $View.Close()
-    }
-    catch {
-        Write-CMTraceLog -Message "Error reading Property table from $MsiPath - $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+        catch {
+            Write-CMTraceLog -Message "Error reading '$Key' from $MsiPath - $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+        }
+        finally {
+            if ($null -ne $View) {
+                try { $View.Close() } catch {}
+            }
+        }
     }
 
     return $ProductInfo
