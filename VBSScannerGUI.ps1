@@ -203,6 +203,7 @@ function Get-ArchiveMetadataFromPath {
         PackageName = ""
         Version     = ""
         Build       = ""
+        PackagePath = ""   # "Vendor\AppName\Version" — first 3 directory segments after archive root
     }
 
     try {
@@ -217,14 +218,22 @@ function Get-ArchiveMetadataFromPath {
         $RelativePath = $FullPath.Substring($ArchiveRoot.Length).TrimStart('\', '/')
         $Segments = $RelativePath -split '[\\/]' | Where-Object { $_ -ne '' }
 
+        # PackagePath: first 3 directory segments = Vendor\AppName\Version
+        # $Segments includes the filename as the last element, so directory count = Count-1
+        if ($Segments.Count -gt 1) {
+            $DirSegs = $Segments[0..($Segments.Count - 2)]          # strip filename
+            $TakeN   = [Math]::Min(3, $DirSegs.Count)
+            $Result.PackagePath = ($DirSegs[0..($TakeN - 1)] -join '\')
+        }
+
         if ($Segments.Count -ge 5) {
             $Result.PackageName = $Segments[1]
             $Result.Version = $Segments[2]
             $Result.Build = $Segments[4]
-            Write-CMTraceLog -Message "Extracted metadata - Package: $($Result.PackageName), Version: $($Result.Version), Build: $($Result.Build) from $FullPath" -Component "ArchiveMetadata"
+            Write-CMTraceLog -Message "Extracted metadata - Package: $($Result.PackageName), Version: $($Result.Version), Build: $($Result.Build), PackagePath: $($Result.PackagePath) from $FullPath" -Component "ArchiveMetadata"
         }
         else {
-            Write-CMTraceLog -Message "Path structure incomplete (expected 5+ segments, got $($Segments.Count)). Path: $FullPath" -Severity 2 -Component "ArchiveMetadata"
+            Write-CMTraceLog -Message "Path structure incomplete (got $($Segments.Count) segments). PackagePath: $($Result.PackagePath). Path: $FullPath" -Severity 2 -Component "ArchiveMetadata"
         }
     }
     catch {
@@ -289,7 +298,8 @@ function New-MsiFinding {
         [string]$TableOrSource,
         [string]$ItemName,
         [string]$Evidence,
-        [string]$Severity = "Info"
+        [string]$Severity = "Info",
+        [string]$PackagePath = ""
     )
 
     return [PSCustomObject]@{
@@ -304,6 +314,7 @@ function New-MsiFinding {
         ItemName        = $ItemName
         Evidence        = $Evidence
         Severity        = $Severity
+        PackagePath     = $PackagePath
     }
 }
 
@@ -325,27 +336,28 @@ function Get-MsiProductInfo {
         ProductCode    = ""
     }
 
-    # Query each property individually — MSI SQL does not support IN, and full-table
-    # iteration leaves unreleased COM Record objects that corrupt STA thread state.
-    foreach ($Key in @('ProductName', 'ProductVersion', 'Manufacturer', 'ProductCode')) {
-        $View = $null
-        try {
-            $View = $Database.OpenView("SELECT Value FROM Property WHERE Property = '$Key'")
-            $View.Execute()
+    # Single full-table scan with immediate per-Record release.
+    # Individual WHERE queries on the Property table (where both the table name and
+    # primary-key column are called "Property") can confuse MSI SQL and leave the
+    # Database COM object in an error state for subsequent queries.
+    $View = $null
+    try {
+        $View = $Database.OpenView("SELECT Property, Value FROM Property")
+        $null = $View.Execute()
+        $Record = $View.Fetch()
+        while ($null -ne $Record) {
+            $Key   = $Record.StringData(1)
+            $Value = $Record.StringData(2)
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Record) | Out-Null
+            if ($ProductInfo.ContainsKey($Key)) { $ProductInfo[$Key] = $Value }
             $Record = $View.Fetch()
-            if ($null -ne $Record) {
-                $ProductInfo[$Key] = $Record.StringData(1)
-                [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Record) | Out-Null
-            }
         }
-        catch {
-            Write-CMTraceLog -Message "Error reading '$Key' from $MsiPath - $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
-        }
-        finally {
-            if ($null -ne $View) {
-                try { $View.Close() } catch {}
-            }
-        }
+    }
+    catch {
+        Write-CMTraceLog -Message "Error reading Property table from $MsiPath - $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+    }
+    finally {
+        if ($null -ne $View) { try { $null = $View.Close() } catch {} }
     }
 
     return $ProductInfo
@@ -378,7 +390,7 @@ function Find-VBScriptCustomActions {
     try {
         $Query = "SELECT Action, Type, Source, Target FROM CustomAction"
         $View = $Database.OpenView($Query)
-        $View.Execute()
+        $null = $View.Execute()
 
         $Record = $View.Fetch()
         while ($null -ne $Record) {
@@ -434,10 +446,11 @@ function Find-VBScriptCustomActions {
         }
     }
     catch {
-        Write-CMTraceLog -Message "Error querying CustomAction table: $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+        Write-CMTraceLog -Message "Error querying CustomAction table in $MsiPath - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
+        $Script:MsiErrorCount++
     }
     finally {
-        if ($null -ne $View) { try { $View.Close() } catch {} }
+        if ($null -ne $View) { try { $null = $View.Close() } catch {} }
     }
 
     return $Findings
@@ -464,7 +477,7 @@ function Find-ActiveSetupIndicators {
         # WHERE clause pre-filters at DB level - avoids transferring all registry rows over UNC
         $Query = "SELECT Registry, Root, Key, Name, Value FROM Registry WHERE Key LIKE '%Active Setup%'"
         $View = $Database.OpenView($Query)
-        $View.Execute()
+        $null = $View.Execute()
 
         $Record = $View.Fetch()
         while ($null -ne $Record) {
@@ -530,10 +543,11 @@ function Find-ActiveSetupIndicators {
         }
     }
     catch {
-        Write-CMTraceLog -Message "Error querying Registry table: $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+        Write-CMTraceLog -Message "Error querying Registry table in $MsiPath - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
+        $Script:MsiErrorCount++
     }
     finally {
-        if ($null -ne $View) { try { $View.Close() } catch {} }
+        if ($null -ne $View) { try { $null = $View.Close() } catch {} }
     }
 
     return $Findings
@@ -567,7 +581,7 @@ function Find-BinaryScriptContent {
         Write-CMTraceLog -Message "Deep scanning Binary table in $MsiPath" -Component "MSIScan"
         $Query = "SELECT Name, Data FROM Binary"
         $View = $Database.OpenView($Query)
-        $View.Execute()
+        $null = $View.Execute()
 
         $TempFolder = [System.IO.Path]::GetTempPath()
 
@@ -578,7 +592,7 @@ function Find-BinaryScriptContent {
 
             try {
                 # Extract binary stream to temp file
-                $Record.SetStream(2, $TempFile)
+                $null = $Record.SetStream(2, $TempFile)
 
                 # Read and scan for markers
                 if (Test-Path -Path $TempFile) {
@@ -638,7 +652,7 @@ function Find-BinaryScriptContent {
 
             $Record = $View.Fetch()
         }
-        $View.Close()
+        $null = $View.Close()
     }
     catch {
         Write-CMTraceLog -Message "Error querying Binary table: $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
@@ -789,6 +803,7 @@ function Start-MsiMstScan {
         [bool]$DeepScanBinary = $false,
         [bool]$DetectActiveSetup = $true,
         [string]$ExtensionFilter = ".msi;.mst",
+        [string]$ArchiveRoot = "",
         [System.Windows.Forms.ProgressBar]$ProgressBar,
         [System.Windows.Forms.Label]$StatusLabel,
         [System.Windows.Forms.DataGridView]$DataGrid,
@@ -932,6 +947,11 @@ function Start-MsiMstScan {
         $Script:MsiFilesScanned++
         if ($FileFindings.Count -gt 0) {
             $Script:MsiFilesWithFindings++
+            # Inject PackagePath when scanning an archive-rooted path
+            if ($ArchiveRoot) {
+                $Meta = Get-ArchiveMetadataFromPath -ArchiveRoot $ArchiveRoot -FullPath $FilePath
+                foreach ($F in $FileFindings) { $F.PackagePath = $Meta.PackagePath }
+            }
             foreach ($F in $FileFindings) { $null = $Script:MsiScanResults.Add($F) }
         }
         $Completed++
@@ -953,6 +973,7 @@ function Start-MsiMstScan {
         foreach ($Finding in $Script:MsiScanResults) {
             if ([string]::IsNullOrWhiteSpace($Finding.InstallerPath)) { continue }
             $RowIndex = $DataGrid.Rows.Add(
+                $Finding.PackagePath,
                 $Finding.InstallerPath,
                 $Finding.FileType,
                 $Finding.ProductName,
@@ -978,7 +999,7 @@ function Start-MsiMstScan {
     $ProgressBar.Style = "Continuous"
     $ProgressBar.Value = 100
 
-    Write-CMTraceLog -Message "Parallel scan complete. Scanned: $($Script:MsiFilesScanned) files, Findings: $($Script:MsiScanResults.Count), Errors: $($Script:MsiErrorCount) | Elapsed: $([Math]::Round($ScanTimer.Elapsed.TotalSeconds,2))s | Threads: $MaxThreads" -Component "MSIScan"
+    Write-CMTraceLog -Message "Sequential scan complete. Scanned: $($Script:MsiFilesScanned) files, Findings: $($Script:MsiScanResults.Count), Errors: $($Script:MsiErrorCount) | Elapsed: $([Math]::Round($ScanTimer.Elapsed.TotalSeconds,2))s" -Component "MSIScan"
     return $true
 }
 #endregion
@@ -1035,6 +1056,7 @@ function New-HtmlReport {
         $RowClass = if ($RowNumber % 2 -eq 0) { "even" } else { "odd" }
         $SafeFileName = [System.Web.HttpUtility]::HtmlEncode($File.FileName)
         $SafeFullPath = [System.Web.HttpUtility]::HtmlEncode($File.FullPath)
+        $SafePackagePath = [System.Web.HttpUtility]::HtmlEncode($File.PackagePath)
         $FormattedDate = $File.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")
         $FormattedSize = "{0:N0}" -f $File.SizeBytes
 
@@ -1044,6 +1066,7 @@ function New-HtmlReport {
 
         <tr class="$RowClass">
             <td class="row-num">$RowNumber</td>
+            <td>$SafePackagePath</td>
             <td>$SafeFileName</td>
             <td class="path-cell"><a href="$FileUri" title="Click to open in Notepad">$SafeFullPath</a></td>
             <td class="date-cell">$FormattedDate</td>
@@ -1209,6 +1232,7 @@ function New-HtmlReport {
                 <thead>
                     <tr>
                         <th>#</th>
+                        <th>Package</th>
                         <th>File Name</th>
                         <th>Full Path</th>
                         <th>Last Modified</th>
@@ -1249,6 +1273,7 @@ function New-MsiHtmlReport {
     param(
         [array]$Findings,
         [string]$ScanRoot,
+        [string]$EntryType = "",
         [datetime]$StartTime,
         [datetime]$EndTime,
         [int]$ErrorCount,
@@ -1285,6 +1310,27 @@ function New-MsiHtmlReport {
     $WarningCount = ($Findings | Where-Object { $_.Severity -eq "Warning" }).Count
     $InfoCount = ($Findings | Where-Object { $_.Severity -eq "Info" }).Count
 
+    # Package summary (only for Archive Root scans)
+    $PackageSummaryHtml = ""
+    if ($EntryType -eq "ArchiveRoot" -and $Findings.Count -gt 0) {
+        $PackageGroups = $Findings | Where-Object { $_.PackagePath -ne "" } | Group-Object -Property PackagePath | Sort-Object Count -Descending
+        if ($PackageGroups.Count -gt 0) {
+            $PkgRows = ""
+            foreach ($Pkg in $PackageGroups | Select-Object -First 20) {
+                $PkgRows += "<tr><td>$([System.Web.HttpUtility]::HtmlEncode($Pkg.Name))</td><td class='size-cell'>$($Pkg.Count)</td></tr>"
+            }
+            $PackageSummaryHtml = @"
+        <div class="info-box">
+            <h2>Package Summary (Top 20)</h2>
+            <table style="width: auto; min-width: 350px;">
+                <thead><tr><th>Package (Vendor\App\Version)</th><th>Findings</th></tr></thead>
+                <tbody>$PkgRows</tbody>
+            </table>
+        </div>
+"@
+        }
+    }
+
     # Build table rows
     $TableRows = ""
     $RowNumber = 0
@@ -1293,6 +1339,7 @@ function New-MsiHtmlReport {
         $RowClass = if ($RowNumber % 2 -eq 0) { "even" } else { "odd" }
 
         $SafePath = [System.Web.HttpUtility]::HtmlEncode($Finding.InstallerPath)
+        $SafePackagePath = [System.Web.HttpUtility]::HtmlEncode($Finding.PackagePath)
         $SafeProductName = [System.Web.HttpUtility]::HtmlEncode($Finding.ProductName)
         $SafeManufacturer = [System.Web.HttpUtility]::HtmlEncode($Finding.Manufacturer)
         $SafeCategory = [System.Web.HttpUtility]::HtmlEncode($Finding.FindingCategory)
@@ -1313,6 +1360,7 @@ function New-MsiHtmlReport {
 
         <tr class="$RowClass">
             <td class="row-num">$RowNumber</td>
+            <td>$SafePackagePath</td>
             <td class="path-cell"><a href="$ExplorerUri" title="Open in Explorer">$SafePath</a></td>
             <td>$($Finding.FileType)</td>
             <td>$SafeProductName</td>
@@ -1471,6 +1519,8 @@ function New-MsiHtmlReport {
 
         $CategorySummaryHtml
 
+        $PackageSummaryHtml
+
         <div class="results-box">
             <h2>MSI/MST Findings ($($Findings.Count))</h2>
             $(if ($Findings.Count -eq 0) {
@@ -1481,6 +1531,7 @@ function New-MsiHtmlReport {
                 <thead>
                     <tr>
                         <th>#</th>
+                        <th>Package</th>
                         <th>Installer Path</th>
                         <th>Type</th>
                         <th>Product Name</th>
@@ -1648,12 +1699,16 @@ function Start-VbsScan {
         $PackageName = ""
         $Version     = ""
         $Build       = ""
+        $PackagePath = ""
+        $Version     = ""
+        $Build       = ""
 
         if ($EntryType -eq "ArchiveRoot" -and $Script:ArchiveRoot) {
             $Meta        = Get-ArchiveMetadataFromPath -ArchiveRoot $Script:ArchiveRoot -FullPath $Item.FullName
             $PackageName = $Meta.PackageName
             $Version     = $Meta.Version
             $Build       = $Meta.Build
+            $PackagePath = $Meta.PackagePath
         }
 
         $null = $Script:ScanResults.Add([PSCustomObject]@{
@@ -1665,6 +1720,7 @@ function Start-VbsScan {
             PackageName   = $PackageName
             Version       = $Version
             Build         = $Build
+            PackagePath   = $PackagePath
         })
 
         $Processed++
@@ -1685,6 +1741,7 @@ function Start-VbsScan {
     try {
         foreach ($FileInfo in $Script:ScanResults) {
             $null = $DataGrid.Rows.Add(
+                $FileInfo.PackagePath,
                 $FileInfo.FileName,
                 $FileInfo.FullPath,
                 $FileInfo.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"),
@@ -2067,8 +2124,9 @@ function Build-MainForm {
 
     # VBS Grid Columns
     @(
-        @{Name="FileName"; Header="File Name"; Weight=20},
-        @{Name="FullPath"; Header="Full Path"; Weight=55},
+        @{Name="PackagePath"; Header="Package"; Weight=15},
+        @{Name="FileName"; Header="File Name"; Weight=18},
+        @{Name="FullPath"; Header="Full Path"; Weight=42},
         @{Name="LastWriteTime"; Header="Last Modified"; Weight=15},
         @{Name="SizeBytes"; Header="Size (Bytes)"; Weight=10}
     ) | ForEach-Object {
@@ -2118,7 +2176,8 @@ function Build-MainForm {
 
     # MSI Grid Columns
     @(
-        @{Name="InstallerPath"; Header="Installer Path"; Weight=20},
+        @{Name="PackagePath"; Header="Package"; Weight=12},
+        @{Name="InstallerPath"; Header="Installer Path"; Weight=18},
         @{Name="FileType"; Header="Type"; Weight=5},
         @{Name="ProductName"; Header="Product Name"; Weight=13},
         @{Name="ProductVersion"; Header="Version"; Weight=7},
@@ -2403,7 +2462,7 @@ function Build-MainForm {
             $Success = New-HtmlReport -Results $Script:ScanResults -ScanRoot $ScanRoot -EntryType $EntryType -StartTime $Script:StartTime -EndTime $EndTime -ErrorCount $Script:ErrorCount -OutputPath $Script:HtmlReportFile
         }
         else {
-            $Success = New-MsiHtmlReport -Findings $Script:MsiScanResults -ScanRoot $ScanRoot -StartTime $Script:StartTime -EndTime $EndTime -ErrorCount $Script:MsiErrorCount -FilesScanned $Script:MsiFilesScanned -FilesWithFindings $Script:MsiFilesWithFindings -OutputPath $Script:HtmlReportFile
+            $Success = New-MsiHtmlReport -Findings $Script:MsiScanResults -ScanRoot $ScanRoot -EntryType $EntryType -StartTime $Script:StartTime -EndTime $EndTime -ErrorCount $Script:MsiErrorCount -FilesScanned $Script:MsiFilesScanned -FilesWithFindings $Script:MsiFilesWithFindings -OutputPath $Script:HtmlReportFile
         }
 
         if ($Success) {
@@ -2506,7 +2565,8 @@ function Build-MainForm {
             Write-CMTraceLog -Message "Starting MSI/MST scan - Root: $ScanRoot | ScanMsi: $($ChkScanMsi.Checked) | ScanMst: $($ChkScanMst.Checked) | DeepBinary: $($ChkDeepBinary.Checked)" -Component "MSIScan"
 
             $TabControl.SelectedTab = $TabMsiResults
-            $Success = Start-MsiMstScan -ScanRoot $ScanRoot -Recurse $ChkMsiRecurse.Checked -ExcludePaths $MsiExcludePaths -ScanMsi $ChkScanMsi.Checked -ScanMst $ChkScanMst.Checked -DeepScanBinary $ChkDeepBinary.Checked -DetectActiveSetup $ChkActiveSetup.Checked -ProgressBar $ProgressBar -StatusLabel $LblStatus -DataGrid $DataGridViewMsi -ParentForm $MainForm
+            $ArchiveRootForScan = if ($EntryType -eq "ArchiveRoot") { $ScanRoot } else { "" }
+            $Success = Start-MsiMstScan -ScanRoot $ScanRoot -Recurse $ChkMsiRecurse.Checked -ExcludePaths $MsiExcludePaths -ScanMsi $ChkScanMsi.Checked -ScanMst $ChkScanMst.Checked -DeepScanBinary $ChkDeepBinary.Checked -DetectActiveSetup $ChkActiveSetup.Checked -ArchiveRoot $ArchiveRootForScan -ProgressBar $ProgressBar -StatusLabel $LblStatus -DataGrid $DataGridViewMsi -ParentForm $MainForm
 
             if ($Success -and -not $Script:ScanCancelled) {
                 $Duration = (Get-Date) - $Script:StartTime
@@ -2515,6 +2575,19 @@ function Build-MainForm {
                 $LblStats.Text = "Files scanned: $($Script:MsiFilesScanned)" + [Environment]::NewLine + "Findings: $($Script:MsiScanResults.Count)" + [Environment]::NewLine + "Errors: $($Script:MsiErrorCount)" + [Environment]::NewLine + "Duration: $($Duration.ToString('hh\:mm\:ss'))"
                 $BtnGenerateReport.Enabled = $Script:MsiScanResults.Count -gt 0
                 $BtnExportCSV.Enabled = $Script:MsiScanResults.Count -gt 0
+
+                # Show a diagnostic popup only when something seems wrong: files were scanned,
+                # zero findings were returned, AND there were scan errors — so the user knows
+                # to check the CMTrace log rather than assume the MSIs are clean.
+                if ($Script:MsiFilesScanned -gt 0 -and $Script:MsiScanResults.Count -eq 0 -and $Script:MsiErrorCount -gt 0) {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Scan finished with $($Script:MsiFilesScanned) file(s) scanned but 0 findings.`n" +
+                        "$($Script:MsiErrorCount) error(s) occurred while reading MSI tables.`n`n" +
+                        "Please review the CMTrace log for details:`n$Script:LogPath",
+                        "MSI Scan — Errors Detected",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
+                        [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+                }
             }
         }
 
