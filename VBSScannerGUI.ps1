@@ -374,6 +374,7 @@ function Find-VBScriptCustomActions {
     $VBScriptTypes = @(6, 22, 38, 54)
     $ScriptIndicators = @("cscript", "wscript", ".vbs", "vbscript", "script.exe")
 
+    $View = $null
     try {
         $Query = "SELECT Action, Type, Source, Target FROM CustomAction"
         $View = $Database.OpenView($Query)
@@ -428,12 +429,15 @@ function Find-VBScriptCustomActions {
                 }
             }
 
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Record) | Out-Null
             $Record = $View.Fetch()
         }
-        $View.Close()
     }
     catch {
         Write-CMTraceLog -Message "Error querying CustomAction table: $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+    }
+    finally {
+        if ($null -ne $View) { try { $View.Close() } catch {} }
     }
 
     return $Findings
@@ -455,6 +459,7 @@ function Find-ActiveSetupIndicators {
     $ActiveSetupPattern = "Active Setup\\Installed Components"
     $ScriptIndicators = @("cscript", "wscript", ".vbs", "script")
 
+    $View = $null
     try {
         # WHERE clause pre-filters at DB level - avoids transferring all registry rows over UNC
         $Query = "SELECT Registry, Root, Key, Name, Value FROM Registry WHERE Key LIKE '%Active Setup%'"
@@ -520,12 +525,15 @@ function Find-ActiveSetupIndicators {
                 }
             }
 
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Record) | Out-Null
             $Record = $View.Fetch()
         }
-        $View.Close()
     }
     catch {
         Write-CMTraceLog -Message "Error querying Registry table: $($_.Exception.Message)" -Severity 2 -Component "MSIScan"
+    }
+    finally {
+        if ($null -ne $View) { try { $View.Close() } catch {} }
     }
 
     return $Findings
@@ -655,10 +663,13 @@ function Scan-MsiFile {
     $Findings = [System.Collections.ArrayList]::new()
 
     $OwnInstaller = ($null -eq $SharedInstaller)
-    $Installer = if ($OwnInstaller) { New-Object -ComObject WindowsInstaller.Installer } else { $SharedInstaller }
-    $Database = $null
+    $Installer     = $null
+    $Database      = $null
 
     try {
+        # Create COM Installer inside try so registration errors are caught
+        $Installer = if ($OwnInstaller) { New-Object -ComObject WindowsInstaller.Installer } else { $SharedInstaller }
+
         # Open database read-only (mode 0)
         $Database = $Installer.OpenDatabase($MsiPath, 0)
 
@@ -885,118 +896,54 @@ function Start-MsiMstScan {
     }
 
     # ============================================================
-    # PHASE 2 — Parallel scan via RunspacePool (STA required for COM)
+    # PHASE 2 — Sequential scan on main (STA) thread
+    # RunspacePool was removed: COM objects (WindowsInstaller.Installer) do not
+    # reliably survive PS object serialisation across runspace boundaries, which
+    # silently drops all findings.  The main WinForms thread is already STA, so
+    # COM works perfectly here.  DoEvents() keeps the UI responsive.
     # ============================================================
-    $MaxThreads = [Math]::Max(2, [Math]::Min(8, [Environment]::ProcessorCount))
-    $StatusLabel.Text = "Starting parallel scan ($MaxThreads threads) for $TotalFiles files..."
-    [System.Windows.Forms.Application]::DoEvents()
-    Write-CMTraceLog -Message "Parallel scan: $MaxThreads threads, $TotalFiles files" -Component "MSIScan"
-
-    # Inject scanning functions into each worker runspace
-    $InitState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    foreach ($FuncName in @('New-MsiFinding','Get-MsiProductInfo','Find-VBScriptCustomActions',
-                             'Find-ActiveSetupIndicators','Find-BinaryScriptContent','Scan-MsiFile','Scan-MstFile')) {
-        $FuncDef = (Get-Item "function:\$FuncName").Definition
-        $InitState.Commands.Add(
-            [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new($FuncName, $FuncDef)
-        )
-    }
-    # No-op Write-CMTraceLog in workers (avoids log file contention; main thread logs summary)
-    $InitState.Commands.Add(
-        [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
-            'Write-CMTraceLog',
-            'param([string]$Message,[int]$Severity=1,[string]$Component="MSIScan")'
-        )
-    )
-
-    $Pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(
-        1, $MaxThreads, $InitState, $Host)
-    $Pool.ApartmentState = [System.Threading.ApartmentState]::STA
-    $Pool.Open()
-
-    # Worker script: each runspace scans exactly one file and returns its findings
-    $WorkerScript = {
-        param([string]$FilePath, [bool]$DeepScanBinary, [bool]$DetectActiveSetup)
-        try {
-            $Ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
-            if ($Ext -eq '.msi') {
-                return Scan-MsiFile -MsiPath $FilePath -DeepScanBinary $DeepScanBinary -DetectActiveSetup $DetectActiveSetup
-            }
-            elseif ($Ext -eq '.mst') { return Scan-MstFile -MstPath $FilePath }
-        }
-        catch { Write-Error "[$FilePath] $($_.Exception.Message)" }
-        return @()
-    }
-
-    # Throttled submission: keep pool fed (MaxThreads*3 queue) without allocating all jobs at once
-    $ActiveJobs = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $FileIdx    = 0
     $Completed  = 0
-    $MaxQueue   = $MaxThreads * 3
     $UITimer.Restart()
+    $ProgressBar.Style = "Continuous"
+    $StatusLabel.Text  = "Scanning $TotalFiles MSI/MST files..."
+    [System.Windows.Forms.Application]::DoEvents()
+    Write-CMTraceLog -Message "Starting sequential MSI/MST scan: $TotalFiles files" -Component "MSIScan"
 
-    while ($FileIdx -lt $TotalFiles -or $ActiveJobs.Count -gt 0) {
+    foreach ($FilePath in $AllFiles) {
+
         if ($Script:ScanCancelled) {
-            foreach ($J in $ActiveJobs) { try { $J.PS.Stop() } catch {}; $J.PS.Dispose() }
-            $ActiveJobs.Clear()
-            $Pool.Close(); $Pool.Dispose()
-            Write-CMTraceLog -Message "Parallel scan cancelled at $Completed/$TotalFiles files" -Severity 2 -Component "MSIScan"
-            $StatusLabel.Text = "Scan cancelled"
+            Write-CMTraceLog -Message "Scan cancelled at $Completed/$TotalFiles files" -Severity 2 -Component "MSIScan"
+            $StatusLabel.Text      = "Scan cancelled"
             $StatusLabel.ForeColor = [System.Drawing.Color]::Orange
-            $ProgressBar.Style = "Continuous"
             return $false
         }
 
-        # Feed pool: submit new jobs up to queue limit
-        while ($ActiveJobs.Count -lt $MaxQueue -and $FileIdx -lt $TotalFiles) {
-            $FP = $AllFiles[$FileIdx++]
-            $PS = [PowerShell]::Create()
-            $PS.RunspacePool = $Pool
-            $null = $PS.AddScript($WorkerScript).AddParameter('FilePath', $FP).AddParameter('DeepScanBinary', $DeepScanBinary).AddParameter('DetectActiveSetup', $DetectActiveSetup)
-            $ActiveJobs.Add([PSCustomObject]@{ PS = $PS; Handle = $PS.BeginInvoke(); Path = $FP })
+        $Ext          = [System.IO.Path]::GetExtension($FilePath).ToLower()
+        $FileFindings = @()
+        try {
+            if      ($Ext -eq '.msi') { $FileFindings = @(Scan-MsiFile  -MsiPath $FilePath -DeepScanBinary $DeepScanBinary -DetectActiveSetup $DetectActiveSetup) }
+            elseif  ($Ext -eq '.mst') { $FileFindings = @(Scan-MstFile  -MstPath $FilePath) }
+        }
+        catch {
+            $Script:MsiErrorCount++
+            Write-CMTraceLog -Message "Error scanning $FilePath - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
         }
 
-        # Harvest completed jobs
-        $Done = @($ActiveJobs | Where-Object { $_.Handle.IsCompleted })
-        foreach ($J in $Done) {
-            try {
-                $Findings = $J.PS.EndInvoke($J.Handle)
-                $Script:MsiFilesScanned++
-                if ($J.PS.HadErrors) { $Script:MsiErrorCount++ }
-                if ($Findings -and $Findings.Count -gt 0) {
-                    $Script:MsiFilesWithFindings++
-                    foreach ($F in $Findings) { $null = $Script:MsiScanResults.Add($F) }
-                }
-            }
-            catch {
-                $Script:MsiErrorCount++
-                Write-CMTraceLog -Message "Worker error: $($J.Path) - $($_.Exception.Message)" -Severity 3 -Component "MSIScan"
-            }
-            finally { $J.PS.Dispose() }
-            $null = $ActiveJobs.Remove($J)
-            $Completed++
+        $Script:MsiFilesScanned++
+        if ($FileFindings.Count -gt 0) {
+            $Script:MsiFilesWithFindings++
+            foreach ($F in $FileFindings) { $null = $Script:MsiScanResults.Add($F) }
         }
+        $Completed++
 
-        # Update progress every 400 ms or whenever jobs complete
-        if ($UITimer.ElapsedMilliseconds -ge 400 -or $Done.Count -gt 0) {
+        if ($UITimer.ElapsedMilliseconds -ge 300) {
             $Pct = if ($TotalFiles -gt 0) { [Math]::Min(99, [int]($Completed * 100 / $TotalFiles)) } else { 99 }
-            $ProgressBar.Style = "Continuous"
             $ProgressBar.Value = $Pct
-            $StatusLabel.Text = "Scanning ($MaxThreads threads): $Completed / $TotalFiles | Findings: $($Script:MsiScanResults.Count)"
+            $StatusLabel.Text  = "Scanning: $Completed / $TotalFiles | Findings: $($Script:MsiScanResults.Count)"
             [System.Windows.Forms.Application]::DoEvents()
             $UITimer.Restart()
         }
-
-        # Yield CPU briefly when pool is saturated (avoids 100% spin-wait)
-        if ($Done.Count -eq 0 -and $ActiveJobs.Count -ge $MaxQueue) {
-            [System.Threading.Thread]::Sleep(15)
-        }
     }
-
-    $Pool.Close()
-    $Pool.Dispose()
-    [System.GC]::Collect()
-    [System.GC]::WaitForPendingFinalizers()
 
     # Batch-populate DataGrid after scan (avoids per-row repaint during traversal)
     $StatusLabel.Text = "Populating results grid ($($Script:MsiScanResults.Count) findings)..."
