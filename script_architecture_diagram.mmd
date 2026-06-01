@@ -1,0 +1,120 @@
+flowchart TD
+    ENTRY(["▶ Script Entry\nApplication::Run"]):::entry
+
+    subgraph GUI["🖥️ GUI Layer — Build-MainForm"]
+        direction TB
+        BMF["Build-MainForm\nConstructs all controls,\ntabs, grids, menus,\nwires all events"]:::gui
+        BTN_SCAN["BtnScan\nClick Handler"]:::handler
+        BTN_REPORT["BtnGenerateReport\nClick Handler"]:::handler
+        BTN_CANCEL["BtnCancel\nSets ScanCancelled flag"]:::handler
+        CTX_VBS["VBS Context Menu\n(Notepad / Copy / Explorer)"]:::handler
+        CTX_MSI["MSI Context Menu\n(Explorer / Copy Path / Copy Evidence)"]:::handler
+    end
+
+    subgraph INPUT["🔧 Input & Utility"]
+        GSRI["Get-ScanRootFromInput\nDeviceName → \\\\host\\C$\nUNC → as-is\nArchive → trimmed path"]:::util
+        TPA["Test-PathAccessible\nGet-Item guard\nreturns bool"]:::util
+        TPE["Test-PathExcluded\nPrefix-match against\nexclusion list"]:::util
+        LOG["Write-CMTraceLog\nCMTrace-format log\nSeverity 1/2/3"]:::util
+        OFN["Open-FileInNotepad\nnotepad.exe launch"]:::util
+        OFE["Open-FileInExplorer\nexplorer /select,"]:::util
+    end
+
+    subgraph ARCHIVE["📁 Archive Path Engine"]
+        GAMP["Get-ArchiveMetadataFromPath\nSegments path after root\n→ PackagePath Vendor\\App\\Ver\n→ PackageName, Version, Build"]:::archive
+    end
+
+    subgraph VBS_ENGINE["🔍 VBS Scan Engine — Start-VbsScan"]
+        direction TB
+        SVS_P1["Phase 1: Enumerate .vbs\nFast path: Get-ChildItem -Recurse\nExclusion path: Generic.Queue BFS"]:::scan
+        SVS_P2["Phase 2: Build Result Objects\nPSCustomObject per file\n+ PackagePath (archive mode)"]:::scan
+        SVS_P3["Phase 3: Batch Grid Populate\nSuspendLayout / ResumeLayout"]:::scan
+        SVS_P1 --> SVS_P2 --> SVS_P3
+    end
+
+    subgraph MSI_ENGINE["🏗️ MSI/MST Scan Engine — Start-MsiMstScan"]
+        direction TB
+        MSI_P1["Phase 1: Enumerate .msi/.mst\nGet-ChildItem with extension filter"]:::scan
+        MSI_P2["Phase 2: Sequential COM Scan\nOne file at a time on STA thread\nDoEvents every 300ms"]:::scan
+        MSI_P3["Phase 3: Batch Grid Populate\nSuspendLayout / ResumeLayout\n+ PackagePath inject"]:::scan
+        MSI_P1 --> MSI_P2 --> MSI_P3
+    end
+
+    subgraph MSI_WORKERS["⚙️ MSI File Workers"]
+        SMF["Scan-MsiFile\nOwns COM Installer\nOpens DB read-only mode=0\nReleaseComObject in finally\nGC.Collect when owner"]:::worker
+        SMST["Scan-MstFile\nNo COM — binary bytes\nUnicode / ASCII decode\nString indicator match"]:::worker
+    end
+
+    subgraph MSI_DETAIL["🔬 MSI Detail Scanners"]
+        GMPI["Get-MsiProductInfo\nSELECT Property,Value\nFROM Property\nFull-table scan\nReleaseComObject per record"]:::detail
+        FVCA["Find-VBScriptCustomActions\nSELECT from CustomAction\nType mask AND 63\nVBScript types: {6,22,38,54}"]:::detail
+        FASI["Find-ActiveSetupIndicators\nSELECT from Registry\nWHERE Key LIKE Active Setup\nChecks for cscript/wscript refs"]:::detail
+        FBSC["Find-BinaryScriptContent\n⚠ Optional — DeepScan only\nExtracts Binary streams\nSearches for script indicators"]:::detail
+        NMF["New-MsiFinding\nFactory function\nReturns PSCustomObject\n12 properties incl. PackagePath"]:::factory
+    end
+
+    subgraph REPORTS["📄 HTML Report Generation"]
+        NHR["New-HtmlReport\nVBS scan report\nPackage Summary (archive)\nTable: Package│File│Path│Date│Size"]:::report
+        NMHR["New-MsiHtmlReport\nMSI scan report\nCategory Summary\nPackage Summary (archive)\nTable: Package│Path│Type│Product…"]:::report
+    end
+
+    %% Entry → GUI
+    ENTRY --> BMF
+    BMF --> BTN_SCAN & BTN_REPORT & BTN_CANCEL & CTX_VBS & CTX_MSI
+
+    %% BtnScan flow
+    BTN_SCAN -->|"1. resolve path"| GSRI
+    BTN_SCAN -->|"2. validate path"| TPA
+    BTN_SCAN -->|"VBSFileScan mode"| SVS_P1
+    BTN_SCAN -->|"MSIMSTScan mode"| MSI_P1
+
+    %% BtnReport flow
+    BTN_REPORT -->|"VBSFileScan"| NHR
+    BTN_REPORT -->|"MSIMSTScan"| NMHR
+
+    %% Context menus
+    CTX_VBS --> OFN
+    CTX_MSI --> OFE
+
+    %% VBS Engine internals
+    SVS_P1 -->|"exclusion check"| TPE
+    SVS_P1 --> LOG
+    SVS_P2 -->|"archive mode"| GAMP
+    SVS_P2 --> LOG
+
+    %% MSI Engine internals
+    MSI_P2 -->|".msi files"| SMF
+    MSI_P2 -->|".mst files"| SMST
+    MSI_P2 -->|"archive mode\nper file"| GAMP
+    MSI_P2 --> LOG
+    MSI_P1 -->|"path guard"| TPA
+
+    %% Scan-MsiFile internals
+    SMF -->|"always"| GMPI
+    SMF -->|"always"| FVCA
+    SMF -->|"DetectActiveSetup=true"| FASI
+    SMF -->|"DeepScanBinary=true"| FBSC
+    SMF --> LOG
+
+    %% Detail scanners → factory
+    FVCA -->|"per VBScript CA found"| NMF
+    FASI -->|"per Active Setup key"| NMF
+    FBSC -->|"per script match"| NMF
+    SMST -->|"per indicator match"| NMF
+
+    %% Reports → Log
+    NHR --> LOG
+    NMHR --> LOG
+    GAMP --> LOG
+
+    %% Styles
+    classDef entry fill:#1a1a2e,color:#fff,stroke:#5e81f4,stroke-width:2px
+    classDef gui fill:#1a3a5c,color:#fff,stroke:#4fc3f7,stroke-width:2px
+    classDef handler fill:#0d3b2e,color:#fff,stroke:#4caf50,stroke-width:1px
+    classDef util fill:#2e2a1e,color:#fff,stroke:#ffd54f,stroke-width:1px
+    classDef archive fill:#2a1a3e,color:#fff,stroke:#ce93d8,stroke-width:2px
+    classDef scan fill:#1a2e1a,color:#fff,stroke:#81c784,stroke-width:2px
+    classDef worker fill:#3e1a1a,color:#fff,stroke:#ef9a9a,stroke-width:2px
+    classDef detail fill:#2e1a0d,color:#fff,stroke:#ffcc80,stroke-width:1px
+    classDef factory fill:#1a2e3e,color:#fff,stroke:#80deea,stroke-width:2px
+    classDef report fill:#2e2a0d,color:#fff,stroke:#fff176,stroke-width:2px
